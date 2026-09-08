@@ -9,7 +9,7 @@ from .elements import CircularAperture, ThinLens, PlaneMirror, ThinLens3D, Surfa
 from .fiber import Fiber, FiberCouplingResult
 from .slicer import SliceMirror, SlicerArray
 from .pupil import PupilAnalysis, PupilMirror, PupilRelaySystem, generate_one_sided_pupil_positions
-from .system import OpticalSystem, OpticalStage
+from .system import OpticalSystem, OpticalStage, OpticalGeometry
 from .metrics import SystemMetrics, compute_spot_metrics, compute_etendue_check
 from .presets import (
     create_old_lens_system,
@@ -25,6 +25,20 @@ from .design_optimizer import (
     OptimizationConfig,
     SingleNOptimizationResult,
     MultiNStudyResult,
+)
+from .fore_optics import (
+    ForeOpticsMode,
+    ForeOpticsConfig,
+    ForeOpticsSystem,
+    build_fore_optics_system,
+    AVAILABLE_HARDWARE_FOCAL_LENGTHS,
+    compute_theoretical_focal_length_for_d90,
+    optimize_hardware_fore_optics,
+)
+from .sensitivity import (
+    ToleranceSensitivityEngine,
+    SensitivityCurve,
+    SensitivityReport,
 )
 
 __all__ = [
@@ -61,7 +75,11 @@ __all__ = [
     "SingleNOptimizationResult",
     "MultiNStudyResult",
     "PowerAccounting",
+    "SlicePowerShare",
     "compute_etendue",
+    "AngularMetrics",
+    "compute_angular_metrics",
+    "classify_fiber_phase_space",
     "run_all_validations",
     "ValidationSuiteReport",
     "ValidationCaseResult",

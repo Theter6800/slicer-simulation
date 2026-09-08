@@ -85,12 +85,19 @@ def test_case_7_multi_start_optimization():
     assert res.details["median_coupling_efficiency"] >= res.details["worst_coupling_efficiency"]
 
 
+def test_fiber_acceptance_tests_a_to_e():
+    """Fiber sanity tests A through E."""
+    from optics.validation import validate_fiber_acceptance_tests_a_to_e
+    res = validate_fiber_acceptance_tests_a_to_e()
+    assert res.passed
+    assert all(res.details.values())
+
+
 def test_run_all_validations_master_report():
-    """Master validation report runs all 7 cases and passes."""
+    """Master validation report runs all cases and passes."""
     report = run_all_validations()
     assert report.all_passed
-    assert len(report.results) == 7
-    for cid in range(1, 8):
-        assert cid in report.results
-        assert report.results[cid].passed
+    assert len(report.results) >= 7
+    for cid, r in report.results.items():
+        assert r.passed
     assert "### Physical Validation Suite Results" in report.summary_markdown

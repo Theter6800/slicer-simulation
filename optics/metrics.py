@@ -1,5 +1,5 @@
 """
-Optical metrics, spot analysis, loss budget accounting, and étendue sanity checking.
+Optical metrics, spot analysis, loss budget accounting, phase-space classification, and étendue checking.
 """
 
 from __future__ import annotations
@@ -16,13 +16,37 @@ class SpotMetrics:
     centroid_x: float
     centroid_y: float
     rms_radius: float
+    encircled_50_radius: float
     encircled_80_radius: float
-    encircled_80_diameter: float
+    encircled_90_radius: float
+    encircled_95_radius: float
+    diameter_50: float
+    diameter_80: float
     diameter_90: float
+    diameter_95: float
     bbox_width: float
     bbox_height: float
+    peak_x: float
+    peak_y: float
     total_power: float
     n_active_rays: int
+
+    # Backwards compatibility properties
+    @property
+    def encircled_80_diameter(self) -> float:
+        return self.diameter_80
+
+
+@dataclass
+class AngularMetrics:
+    """Ray angular distribution metrics at the fiber face."""
+    theta_rms_deg: float
+    theta_50_deg: float
+    theta_80_deg: float
+    theta_90_deg: float
+    theta_max_deg: float
+    mean_theta_deg: float
+    na_max_numerical: float
 
 
 def compute_spot_metrics(
@@ -33,6 +57,7 @@ def compute_spot_metrics(
     """
     Compute geometric spot metrics at z_plane (propagating virtually if provided).
     Optionally filter by channel_id.
+    Includes D50, D80, D90, D95, centroid, RMS radius, bbox dimensions, and peak irradiance location.
     """
     mask = bundle.active_mask
     if channel_id is not None:
@@ -46,11 +71,18 @@ def compute_spot_metrics(
             centroid_x=0.0,
             centroid_y=0.0,
             rms_radius=0.0,
+            encircled_50_radius=0.0,
             encircled_80_radius=0.0,
-            encircled_80_diameter=0.0,
+            encircled_90_radius=0.0,
+            encircled_95_radius=0.0,
+            diameter_50=0.0,
+            diameter_80=0.0,
             diameter_90=0.0,
+            diameter_95=0.0,
             bbox_width=0.0,
             bbox_height=0.0,
+            peak_x=0.0,
+            peak_y=0.0,
             total_power=0.0,
             n_active_rays=0,
         )
@@ -85,29 +117,138 @@ def compute_spot_metrics(
     # Encircled energy radii
     sort_idx = np.argsort(dist)
     cum_p = np.cumsum(p_sub[sort_idx])
-    
-    idx_80 = np.searchsorted(cum_p, 0.8 * tot_p) if tot_p > 0 else int(0.8 * len(dist))
-    r_80 = float(dist[sort_idx[min(idx_80, len(dist) - 1)]])
 
-    idx_90 = np.searchsorted(cum_p, 0.9 * tot_p) if tot_p > 0 else int(0.9 * len(dist))
-    r_90 = float(dist[sort_idx[min(idx_90, len(dist) - 1)]])
+    def get_encircled_radius(fraction: float) -> float:
+        if tot_p <= 0 or len(dist) == 0:
+            return 0.0
+        idx = np.searchsorted(cum_p, fraction * tot_p)
+        return float(dist[sort_idx[min(idx, len(dist) - 1)]])
+
+    r_50 = get_encircled_radius(0.50)
+    r_80 = get_encircled_radius(0.80)
+    r_90 = get_encircled_radius(0.90)
+    r_95 = get_encircled_radius(0.95)
 
     bbox_w = float(np.ptp(x)) if len(x) > 0 else 0.0
     bbox_h = float(np.ptp(y)) if len(y) > 0 else 0.0
+
+    # Peak irradiance location using 2D histogram
+    if len(x) >= 4 and bbox_w > 1e-6 and bbox_h > 1e-6:
+        n_bins = min(40, max(10, int(np.sqrt(len(x)))))
+        hist, x_edges, y_edges = np.histogram2d(x, y, bins=n_bins, weights=p_sub)
+        max_idx = np.unravel_index(np.argmax(hist), hist.shape)
+        peak_x = float(0.5 * (x_edges[max_idx[0]] + x_edges[max_idx[0] + 1]))
+        peak_y = float(0.5 * (y_edges[max_idx[1]] + y_edges[max_idx[1] + 1]))
+    else:
+        peak_x = cx
+        peak_y = cy
 
     return SpotMetrics(
         z=target_z,
         centroid_x=cx,
         centroid_y=cy,
         rms_radius=float(rms),
+        encircled_50_radius=r_50,
         encircled_80_radius=r_80,
-        encircled_80_diameter=2.0 * r_80,
+        encircled_90_radius=r_90,
+        encircled_95_radius=r_95,
+        diameter_50=2.0 * r_50,
+        diameter_80=2.0 * r_80,
         diameter_90=2.0 * r_90,
+        diameter_95=2.0 * r_95,
         bbox_width=bbox_w,
         bbox_height=bbox_h,
+        peak_x=peak_x,
+        peak_y=peak_y,
         total_power=tot_p,
         n_active_rays=len(indices),
     )
+
+
+def compute_angular_metrics(
+    incidence_angles_rad: np.ndarray,
+    weights: Optional[np.ndarray] = None,
+) -> AngularMetrics:
+    """
+    Computes angular distribution metrics at the fiber face (theta in degrees and NA).
+    """
+    if len(incidence_angles_rad) == 0:
+        return AngularMetrics(
+            theta_rms_deg=0.0,
+            theta_50_deg=0.0,
+            theta_80_deg=0.0,
+            theta_90_deg=0.0,
+            theta_max_deg=0.0,
+            mean_theta_deg=0.0,
+            na_max_numerical=0.0,
+        )
+
+    theta_deg = np.degrees(incidence_angles_rad)
+    w = weights if weights is not None else np.ones_like(theta_deg)
+    tot_w = float(np.sum(w))
+
+    if tot_w <= 0:
+        tot_w = float(len(theta_deg))
+        w = np.ones_like(theta_deg)
+
+    mean_th = float(np.average(theta_deg, weights=w))
+    rms_th = float(np.sqrt(max(0.0, np.average(theta_deg**2, weights=w))))
+    max_th = float(np.max(theta_deg))
+
+    sort_idx = np.argsort(theta_deg)
+    cum_w = np.cumsum(w[sort_idx])
+
+    def get_percentile_angle(frac: float) -> float:
+        idx = np.searchsorted(cum_w, frac * tot_w)
+        return float(theta_deg[sort_idx[min(idx, len(theta_deg) - 1)]])
+
+    th_50 = get_percentile_angle(0.50)
+    th_80 = get_percentile_angle(0.80)
+    th_90 = get_percentile_angle(0.90)
+
+    return AngularMetrics(
+        theta_rms_deg=rms_th,
+        theta_50_deg=th_50,
+        theta_80_deg=th_80,
+        theta_90_deg=th_90,
+        theta_max_deg=max_th,
+        mean_theta_deg=mean_th,
+        na_max_numerical=float(np.sin(np.radians(max_th))),
+    )
+
+
+def classify_fiber_phase_space(
+    r_fiber_mm: np.ndarray,
+    theta_fiber_deg: np.ndarray,
+    core_radius_max_mm: float = 0.5,
+    theta_na_max_deg: float = 12.71,
+) -> Dict[str, Any]:
+    """
+    Classifies rays reaching the fiber plane into 4 phase-space categories:
+    - GREEN:  r <= 0.5 mm AND theta <= 12.71 deg (Both pass: fully coupled)
+    - ORANGE: r <= 0.5 mm AND theta > 12.71 deg  (Core accepted, NA rejected)
+    - BLUE:   r > 0.5 mm  AND theta <= 12.71 deg (Core rejected, NA accepted)
+    - RED:    r > 0.5 mm  AND theta > 12.71 deg  (Both rejected)
+    """
+    core_pass = r_fiber_mm <= core_radius_max_mm
+    na_pass = theta_fiber_deg <= theta_na_max_deg
+
+    green_mask = core_pass & na_pass
+    orange_mask = core_pass & (~na_pass)
+    blue_mask = (~core_pass) & na_pass
+    red_mask = (~core_pass) & (~na_pass)
+
+    return {
+        "green_mask": green_mask,
+        "orange_mask": orange_mask,
+        "blue_mask": blue_mask,
+        "red_mask": red_mask,
+        "n_green": int(np.sum(green_mask)),
+        "n_orange": int(np.sum(orange_mask)),
+        "n_blue": int(np.sum(blue_mask)),
+        "n_red": int(np.sum(red_mask)),
+        "total_rays": len(r_fiber_mm),
+    }
 
 
 def scan_beam_size_vs_z(
@@ -185,13 +326,11 @@ def compute_etendue_check(
     G_sun = A_aperture * Omega_sun = pi * (D_ap / 2)^2 * (pi * sin^2(alpha_sun))
     G_led = A_led * Omega_aperture
     """
-    # Fiber étendue
     r_core = fiber_core_diameter / 2.0
     a_fiber = np.pi * (r_core**2)
     omega_fiber = np.pi * (fiber_na**2)
     g_fiber = a_fiber * omega_fiber
 
-    # Source étendue
     r_ap = aperture_diameter / 2.0
     a_ap = np.pi * (r_ap**2)
 
@@ -202,7 +341,6 @@ def compute_etendue_check(
     else:  # LED
         r_led = max(source_diameter / 2.0, 0.05)
         a_led = np.pi * (r_led**2)
-        # Numerical aperture of fore-optics aperture viewed from LED
         theta_ap = np.arctan2(r_ap, max(source_distance, 1.0))
         omega_source = np.pi * (np.sin(theta_ap)**2)
         g_source = a_led * omega_source
@@ -266,3 +404,7 @@ class SystemMetrics:
     
     per_channel_stats: Dict[int, Dict[str, float]]
     loss_budget_table: List[Dict[str, Any]]
+
+    # Enhanced diagnostics fields
+    pre_slicer_spot_metrics: Optional[SpotMetrics] = None
+    fiber_angular_metrics: Optional[AngularMetrics] = None

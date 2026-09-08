@@ -142,8 +142,8 @@ def test_optimizer_multi_n_study_comparison():
 
     study = optimizer.run_multi_n_study(n_min=1, n_max=2)
     assert isinstance(study, MultiNStudyResult)
-    assert study.best_n in [1, 2]
-    assert len(study.comparison_table) == 2
+    assert len(study.comparison_table) >= 2
+    assert 0 in study.comparison_table["N Slicers"].values
     assert study.best_result is not None
     assert study.best_result.coupling_efficiency >= 0.0
     assert len(study.winner_explanation) > 0

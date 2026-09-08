@@ -11,7 +11,7 @@ from .elements import ThinLens, CircularAperture, ThinLens3D
 from .slicer import SlicerArray, SliceMirror
 from .pupil import PupilRelaySystem, PupilMirror
 from .fiber import Fiber
-from .system import OpticalSystem
+from .system import OpticalSystem, OpticalGeometry
 
 
 def create_old_lens_system(
@@ -178,6 +178,7 @@ def create_branched_slicer_system(
     fiber_core_diameter: float = 1.0,
     fiber_na: float = 0.22,
     fiber_distance: Optional[float] = None,
+    wrong_pupil_policy: str = "reject_as_stray",
 ) -> OpticalSystem:
     """
     PRESET 3: "Asymmetric One-Sided Branched Slicer → Pupil Relay → Common Relay Axis → Condenser → Fiber"
@@ -197,7 +198,11 @@ def create_branched_slicer_system(
         diameter=aperture_diameter,
     )
     if fore_lens_focal_length is not None:
-        z_fore = fore_lens_z if fore_lens_z is not None else (z_slicer - fore_lens_focal_length)
+        if fore_lens_z is not None:
+            z_fore = fore_lens_z
+            z_slicer = z_fore + fore_lens_focal_length  # Strictly locked to image plane
+        else:
+            z_fore = z_slicer - fore_lens_focal_length
         fore_lens = ThinLens(
             name=f"Fore-Optic Objective Lens f={fore_lens_focal_length:.0f}mm",
             z=z_fore,
@@ -329,6 +334,20 @@ def create_branched_slicer_system(
         coupling_optics=[],
         fiber=fiber,
         is_non_sequential_post_slicer=True,
+        wrong_pupil_policy=wrong_pupil_policy,
+        geometry=OpticalGeometry(
+            z_aperture=z_aperture,
+            z_fore=z_fore,
+            fore_focal_length=fore_lens_focal_length if fore_lens_focal_length is not None else 100.0,
+            pupil_distance_z=pupil_distance_z,
+            pupil_transverse_offset=pupil_transverse_offset,
+            condenser_distance_z=condenser_distance_z,
+            condenser_focal_length=condenser_focal_length,
+            fiber_distance=d_fib,
+            slicer_width=sw,
+            slicer_height=sh * actual_n + (actual_n - 1) * slice_gap,
+            min_slicer_gap=slice_gap,
+        ),
     )
     # Attach helper attributes for visualization and diagnostics
     opt_system.relay_axis_origin = p_centroid

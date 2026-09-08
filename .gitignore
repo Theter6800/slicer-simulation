@@ -19,3 +19,7 @@ htmlcov/
 # Operating System files
 .DS_Store
 Thumbs.db
+
+# Streamlit local credentials
+.streamlit/credentials.toml
+

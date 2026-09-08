@@ -5,3 +5,11 @@ primaryColor = "#2b5c8f"
 backgroundColor = "#ffffff"
 secondaryBackgroundColor = "#f7f9fa"
 textColor = "#1e293b"
+
+[server]
+headless = true
+port = 8501
+
+[browser]
+gatherUsageStats = false
+

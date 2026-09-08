@@ -46,6 +46,11 @@ class SliceMirror:
         n = R @ n0
         return normalize(n)
 
+    @normal.setter
+    def normal(self, n: np.ndarray) -> None:
+        """Explicitly set custom surface normal vector."""
+        self._custom_normal = normalize(np.asarray(n, dtype=np.float64).reshape(3))
+
     def aim_at_pupil(
         self,
         pupil_center: np.ndarray,
