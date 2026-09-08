@@ -130,8 +130,10 @@ st.markdown(
     <style>
     @import url('https://fonts.cdnfonts.com/css/glacial-indifference-2');
     @import url('https://fonts.googleapis.com/css2?family=League+Spartan:wght@300;400;500;600;700&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200');
 
-    html, body, [class*="css"], [class*="st-"], .stMarkdown, .stText, p, h1, h2, h3, h4, h5, h6, span, label, button, input, select, textarea, div, [data-testid="stMetricValue"], [data-testid="stMetricLabel"] {
+    /* Typography applied strictly to text and markdown elements */
+    html, body, .stMarkdown, .stText, p, h1, h2, h3, h4, h5, h6, label, .stMetric, [data-testid="stMetricValue"], [data-testid="stMetricLabel"] {
         font-family: 'Glacial Indifference', 'League Spartan', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
     }
 
@@ -146,10 +148,63 @@ st.markdown(
         font-weight: 700 !important;
     }
 
-    button {
+    button:not([data-testid*="Icon"]) {
         font-family: 'Glacial Indifference', sans-serif !important;
         font-weight: 600 !important;
         letter-spacing: 0.02em;
+    }
+
+    /* Never allow custom typography to override Streamlit icons or Material Symbols */
+    .material-symbols-rounded,
+    .material-symbols-outlined,
+    [class*="material-symbols"],
+    [data-testid*="Icon"],
+    [data-testid="stExpanderToggleIcon"],
+    [data-testid="stExpanderToggleIcon"] *,
+    span[data-testid="stIconMaterial"],
+    [data-testid="stSidebarCollapseButton"] *,
+    i.material-symbols-rounded {
+        font-family: 'Material Symbols Rounded', 'Material Icons', sans-serif !important;
+        font-weight: normal !important;
+        font-style: normal !important;
+        font-size: 20px !important;
+        line-height: 1 !important;
+        letter-spacing: normal !important;
+        text-transform: none !important;
+        display: inline-flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        white-space: nowrap !important;
+        word-wrap: normal !important;
+        direction: ltr !important;
+        font-feature-settings: 'liga' 1 !important;
+        -webkit-font-smoothing: antialiased !important;
+    }
+
+    /* Fix Streamlit expander header alignment and eliminate text overlapping */
+    [data-testid="stExpander"] details summary {
+        display: flex !important;
+        align-items: center !important;
+        gap: 0.5rem !important;
+        cursor: pointer !important;
+    }
+
+    [data-testid="stExpanderToggleIcon"] {
+        display: inline-flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        min-width: 1.5rem !important;
+        width: 1.5rem !important;
+        height: 1.5rem !important;
+        flex-shrink: 0 !important;
+        margin-right: 0.25rem !important;
+    }
+
+    [data-testid="stExpander"] details summary p,
+    [data-testid="stExpander"] details summary span:not([data-testid="stExpanderToggleIcon"]) {
+        margin: 0 !important;
+        display: inline-block !important;
+        vertical-align: middle !important;
     }
     </style>
     """,
