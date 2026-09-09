@@ -408,3 +408,71 @@ class SystemMetrics:
     # Enhanced diagnostics fields
     pre_slicer_spot_metrics: Optional[SpotMetrics] = None
     fiber_angular_metrics: Optional[AngularMetrics] = None
+
+
+@dataclass
+class PhaseSpaceReformattingScore:
+    """Phase-space reformatting assessment comparing architecture N to baseline N=0."""
+    n_channels: int
+    delta_r90_mm: float
+    delta_theta90_deg: float
+    delta_eta_both_conditional: float
+    spatial_compressed: bool
+    angular_expanded: bool
+    joint_improved: bool
+    interpretation: str
+    details: Dict[str, Any]
+
+
+def compute_phase_space_reformatting_score(
+    spot_n: SpotMetrics,
+    spot_0: SpotMetrics,
+    ang_n: AngularMetrics,
+    ang_0: AngularMetrics,
+    eta_both_cond_n: float,
+    eta_both_cond_0: float,
+    n_channels: int = 1,
+) -> PhaseSpaceReformattingScore:
+    """
+    Computes phase-space reformatting metrics comparing N to N=0:
+    - Delta_R90 = R90(N) - R90(0)
+    - Delta_theta90 = theta90(N) - theta90(0)
+    - Delta_eta_both_conditional = eta_both_conditional(N) - eta_both_conditional(0)
+    Generates dynamic physical interpretation without hardcoding.
+    """
+    delta_r90 = float(spot_n.encircled_90_radius - spot_0.encircled_90_radius)
+    delta_th90 = float(ang_n.theta_90_deg - ang_0.theta_90_deg)
+    delta_eta = float(eta_both_cond_n - eta_both_cond_0)
+
+    spat_comp = delta_r90 < -0.01  # shrunk by at least 10 um
+    ang_exp = delta_th90 > 0.1     # widened by at least 0.1 deg
+    joint_imp = delta_eta > 0.005  # improved conditional acceptance by > 0.5%
+
+    if spat_comp and ang_exp:
+        interp = "Spatial compression obtained at cost of angular expansion."
+    elif joint_imp:
+        interp = "Net positive phase-space reformatting achieved."
+    elif (not spat_comp) and ang_exp:
+        interp = "Angular broadening without spatial compression."
+    else:
+        interp = "No useful phase-space reformatting demonstrated."
+
+    return PhaseSpaceReformattingScore(
+        n_channels=n_channels,
+        delta_r90_mm=delta_r90,
+        delta_theta90_deg=delta_th90,
+        delta_eta_both_conditional=delta_eta,
+        spatial_compressed=spat_comp,
+        angular_expanded=ang_exp,
+        joint_improved=joint_imp,
+        interpretation=interp,
+        details={
+            "R90_N": spot_n.encircled_90_radius,
+            "R90_0": spot_0.encircled_90_radius,
+            "theta90_N": ang_n.theta_90_deg,
+            "theta90_0": ang_0.theta_90_deg,
+            "eta_both_cond_N": eta_both_cond_n,
+            "eta_both_cond_0": eta_both_cond_0,
+        },
+    )
+

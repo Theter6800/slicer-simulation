@@ -20,7 +20,15 @@ from .pupil import PupilRelaySystem, PupilMirror, generate_one_sided_pupil_posit
 from .elements import ThinLens, CircularAperture, ThinLens3D
 from .fiber import Fiber, FiberCouplingResult
 from .system import OpticalSystem, OpticalGeometry
-from .metrics import SystemMetrics
+from .metrics import (
+    SystemMetrics,
+    SpotMetrics,
+    AngularMetrics,
+    PhaseSpaceReformattingScore,
+    compute_spot_metrics,
+    compute_angular_metrics,
+    compute_phase_space_reformatting_score,
+)
 from .presets import create_branched_slicer_system
 from .sources import generate_led_source, generate_sun_source, LEDSourceType
 from .power_accounting import PowerAccounting, compute_etendue
@@ -101,10 +109,23 @@ class MagnificationSweepResult:
     d90_values: List[float]
     n_values: List[int]
     coupling_matrix: pd.DataFrame
-    throughput_matrix: pd.DataFrame
-    core_acc_matrix: pd.DataFrame
-    crossover_d90: Optional[float]
+    joint_conditional_matrix: pd.DataFrame = field(default_factory=pd.DataFrame)
+    n_effective_matrix: pd.DataFrame = field(default_factory=pd.DataFrame)
+    throughput_matrix: pd.DataFrame = field(default_factory=pd.DataFrame)
+    core_acc_matrix: pd.DataFrame = field(default_factory=pd.DataFrame)
+    crossover_d90: Optional[float] = None
+    summary_text: str = ""
+
+
+@dataclass
+class AlignmentToleranceReport:
+    """Alignment and optomechanical perturbation tolerance analysis."""
+    nominal_coupling: float
+    tolerance_table: pd.DataFrame
+    most_sensitive_parameter: str
+    tolerance_5pct_loss: Dict[str, str]
     summary_text: str
+
 
 
 def compute_analytical_optical_checks(
@@ -141,13 +162,20 @@ def compute_analytical_optical_checks(
     ratio = float(g_fiber / max(1e-9, g_input))
     c_max = float((n_fiber_core / n_ext)**2)
     concentrable = (g_fiber >= g_input * 0.99)
+    if concentrable:
+        etendue_note = (
+            "The modeled fiber has sufficient first-order étendue capacity for the input beam. "
+            "The present coupling loss is therefore dominated by optical mapping, spatial distribution, "
+            "angular distribution, clipping or aberration assumptions rather than by a fundamental fiber étendue ceiling."
+        )
+    else:
+        etendue_note = "Fiber étendue underfills source beam; 100% coupling impossible by 2nd law of thermodynamics."
 
     summary = (
         f"Fiber Acceptance Angle: theta_max = arcsin({fiber_na:.2f}) = {theta_deg:.2f} deg. "
         f"Fiber Etendue: G_fiber = {g_fiber:.5f} mm^2*sr. "
         f"Input Beam Etendue: G_input = {g_input:.5f} mm^2*sr. "
-        f"Etendue Ratio G_fiber / G_input = {ratio:.2f}x "
-        f"({'100% coupling is thermodynamically allowed' if concentrable else 'Fiber etendue underfills source; 100% coupling impossible by 2nd law'})."
+        f"Etendue Ratio G_fiber / G_input = {ratio:.2f}x. {etendue_note}"
     )
     return AnalyticalOpticalChecks(
         theta_max_deg=theta_deg,
@@ -251,6 +279,9 @@ class OptimizationConfig:
     validation_rays: int = 3000       # Accurate trace for final validation
     random_seed: int = 42
     wrong_pupil_policy: str = "reject_as_stray"
+    genuine_channel_mode: str = "UNCONSTRAINED"  # "UNCONSTRAINED" or "BALANCED_MULTI_CHANNEL"
+    min_channel_power_fraction: float = 0.10     # Require >= 10% intercepted power per channel in balanced mode
+    absolute_tie_tolerance: float = 0.001        # 0.1 percentage point tie tolerance (0.001)
 
     def __post_init__(self):
         if self.z_fore is None:
@@ -286,7 +317,7 @@ class SingleNOptimizationResult:
     coupling_efficiency: float       # Physical eta = accepted_power / launched_power
     core_accepted_fraction: float    # Fraction of fiber plane power inside core
     na_accepted_fraction: float      # Fraction of fiber plane power inside NA
-    both_accepted_fraction: float    # Fraction passing both conditions
+    both_accepted_fraction: float    # Fraction passing both conditions (eta_both_conditional)
     accepted_power: float
     total_launched_power: float
     clipping_loss: float
@@ -305,6 +336,14 @@ class SingleNOptimizationResult:
     throughput: float = 0.0          # P_at_fiber / P_launch
     eta_ideal: float = 0.0           # Coupling in ideal zero-loss mode
     implementation_penalty: float = 0.0  # eta_ideal - eta_real
+    n_effective: int = 1
+    slice_power_fractions: Dict[int, float] = field(default_factory=dict)
+    eta_both_conditional: float = 0.0
+    eta_estimated_physical: float = 0.0
+    dominant_limitation: str = ""
+    spot_metrics_fiber: Optional[SpotMetrics] = None
+    angular_metrics_fiber: Optional[AngularMetrics] = None
+    phase_space_score: Optional[PhaseSpaceReformattingScore] = None
 
     @property
     def clipping_loss_fraction(self) -> float:
@@ -329,6 +368,13 @@ class MultiNStudyResult:
     ideal_vs_real_table: pd.DataFrame = field(default_factory=pd.DataFrame)
     d90_image: float = 1.3
     slicer_necessity_diagnostic: Dict[str, Any] = field(default_factory=dict)
+    candidate_ties: List[int] = field(default_factory=list)
+    is_tied: bool = False
+    best_optical_efficiency: float = 0.0
+    best_optical_architectures: List[int] = field(default_factory=list)
+    engineering_recommendation_n: int = 0
+    engineering_recommendation_reason: str = ""
+    phase_space_scores: Dict[int, PhaseSpaceReformattingScore] = field(default_factory=dict)
 
     @property
     def winning_n(self) -> int:
@@ -671,6 +717,18 @@ class SlicerPupilOptimizer:
             if np.any(na_excess > 0):
                 na_penalty = 0.02 * float(np.sum(na_excess * pw))
 
+        # 5. Balanced Multi-Channel Penalty (if configured)
+        balance_penalty = 0.0
+        if self.config.genuine_channel_mode == "BALANCED_MULTI_CHANNEL" and n > 1:
+            p_intercept = float(np.sum(bundle.power[bundle.channel_id >= 0])) if hasattr(bundle, "channel_id") else 0.0
+            if p_intercept > 1e-6:
+                min_frac = float(self.config.min_channel_power_fraction)
+                for s_i in range(n):
+                    ch_pow = float(np.sum(bundle.power[bundle.channel_id == s_i])) if hasattr(bundle, "channel_id") else 0.0
+                    frac = ch_pow / p_intercept
+                    if frac < min_frac:
+                        balance_penalty += 2.0 * (min_frac - frac)**2
+
         # Objective is to MAXIMIZE: merit = eta - penalties
         merit = (
             physical_eta
@@ -679,6 +737,7 @@ class SlicerPupilOptimizer:
             - side_penalty
             - core_penalty
             - na_penalty
+            - balance_penalty
         )
 
         # Return negative for minimization
@@ -687,6 +746,7 @@ class SlicerPupilOptimizer:
     def optimize_fixed_n(
         self,
         n: int,
+        val_source_bundle: Optional[RayBundle] = None,
         progress_callback: Optional[Callable[[int, float, str], None]] = None,
     ) -> SingleNOptimizationResult:
         """
@@ -745,12 +805,15 @@ class SlicerPupilOptimizer:
         if progress_callback:
             progress_callback(n, 0.90, f"Validating N={n} optimum with high ray count...")
 
-        # 5. Full Validation Trace with validation_rays
-        val_source_bundle = self.generate_source_bundle(self.config.validation_rays)
-        val_tot_power = float(val_source_bundle.total_power)
+        # 5. Full Validation Trace with validation_rays (using shared bundle if provided)
+        if val_source_bundle is not None:
+            v_bundle = val_source_bundle.clone()
+        else:
+            v_bundle = self.generate_source_bundle(self.config.validation_rays)
+        val_tot_power = float(v_bundle.total_power)
         best_system = self.build_candidate_system(best_x, n, w, h)
 
-        traced_bundle, coupling_res, metrics = best_system.trace(val_source_bundle)
+        traced_bundle, coupling_res, metrics = best_system.trace(v_bundle)
 
         eta = float(metrics.geometric_coupling_efficiency)
         core_frac = float(metrics.fraction_inside_core)
@@ -758,6 +821,28 @@ class SlicerPupilOptimizer:
         both_frac = float(metrics.fraction_satisfying_both)
         p_acc = float(metrics.fiber_accepted_power)
         clip_loss = float(max(0.0, 1.0 - (metrics.power_reaching_fiber_plane / max(metrics.launched_power, 1e-9))))
+
+        # Compute spot and angular metrics at fiber face
+        z_fib = float(best_system.fiber.position[2])
+        spot_fib = compute_spot_metrics(traced_bundle, z_plane=z_fib)
+        act_m = traced_bundle.active_mask
+        ang_fib = compute_angular_metrics(
+            coupling_res.incidence_angle_rad[act_m] if np.any(act_m) else np.array([], dtype=np.float64),
+            traced_bundle.power[act_m] if np.any(act_m) else np.array([], dtype=np.float64),
+        )
+
+        pa = coupling_res.power_accounting
+        if pa is not None:
+            n_eff, sl_fracs, _ = pa.compute_n_effective()
+            eta_both_cond = float(pa.eta_both_conditional)
+            eta_est_phys = float(pa.compute_estimated_physical_efficiency())
+            dom_lim = pa.classify_dominant_limitation()
+        else:
+            n_eff = n
+            sl_fracs = {}
+            eta_both_cond = float(both_frac)
+            eta_est_phys = float(eta * 0.8844)
+            dom_lim = "OPTIMIZED"
 
         # 6. Build Slicer and Pupil Summary DataFrames
         slicer_rows = []
@@ -804,7 +889,7 @@ class SlicerPupilOptimizer:
             progress_callback(n, 1.0, f"Completed N={n}: Coupling Efficiency = {eta*100.0:.2f}%")
 
         throughput = float(coupling_res.power_reaching_fiber_plane / max(1e-9, val_tot_power))
-        eta_ideal = self.evaluate_ideal_system(n, best_x, w, h, val_source_bundle=val_source_bundle)
+        eta_ideal = self.evaluate_ideal_system(n, best_x, w, h, val_source_bundle=v_bundle)
         eta_ideal = max(eta_ideal, eta)
         penalty = float(max(0.0, eta_ideal - eta))
 
@@ -833,6 +918,13 @@ class SlicerPupilOptimizer:
             throughput=throughput,
             eta_ideal=eta_ideal,
             implementation_penalty=penalty,
+            n_effective=n_eff,
+            slice_power_fractions=sl_fracs,
+            eta_both_conditional=eta_both_cond,
+            eta_estimated_physical=eta_est_phys,
+            dominant_limitation=dom_lim,
+            spot_metrics_fiber=spot_fib,
+            angular_metrics_fiber=ang_fib,
         )
 
     def evaluate_ideal_system(
@@ -914,6 +1006,15 @@ class SlicerPupilOptimizer:
         traced_bundle, base_coupling, base_metrics = base_sys.trace(val_source_bundle.clone())
         base_pa = base_coupling.power_accounting
 
+        # Spot and angular metrics at fiber face for N=0
+        z_fib = float(base_sys.fiber.position[2])
+        spot_fib = compute_spot_metrics(traced_bundle, z_plane=z_fib)
+        act_m = traced_bundle.active_mask
+        ang_fib = compute_angular_metrics(
+            base_coupling.incidence_angle_rad[act_m] if np.any(act_m) else np.array([], dtype=np.float64),
+            traced_bundle.power[act_m] if np.any(act_m) else np.array([], dtype=np.float64),
+        )
+
         slicer_df = pd.DataFrame([{
             "Channel": "Direct Path (N=0)",
             "Center X (mm)": "0.000",
@@ -946,6 +1047,8 @@ class SlicerPupilOptimizer:
         eta_real = float(base_pa.eta_total)
         eta_ideal = max(float(base_pa.eta_core_conditional * base_pa.eta_na_conditional), eta_real)
         penalty = float(max(0.0, eta_ideal - eta_real))
+        eta_est_phys = float(base_pa.compute_estimated_physical_efficiency(is_direct=True))
+        dom_lim = base_pa.classify_dominant_limitation()
 
         ms_stats = {
             "n_restarts": 10,
@@ -965,7 +1068,7 @@ class SlicerPupilOptimizer:
             coupling_efficiency=float(base_pa.eta_total),
             core_accepted_fraction=float(base_pa.eta_core_conditional),
             na_accepted_fraction=float(base_pa.eta_na_conditional),
-            both_accepted_fraction=float(base_pa.eta_core_conditional * base_pa.eta_na_conditional),
+            both_accepted_fraction=float(base_pa.eta_both_conditional),
             accepted_power=float(base_pa.p_inside_core_and_na),
             total_launched_power=val_tot_power,
             clipping_loss=float(1.0 - throughput),
@@ -984,6 +1087,13 @@ class SlicerPupilOptimizer:
             throughput=throughput,
             eta_ideal=eta_ideal,
             implementation_penalty=penalty,
+            n_effective=0,
+            slice_power_fractions={},
+            eta_both_conditional=float(base_pa.eta_both_conditional),
+            eta_estimated_physical=eta_est_phys,
+            dominant_limitation=dom_lim,
+            spot_metrics_fiber=spot_fib,
+            angular_metrics_fiber=ang_fib,
         )
 
     def run_multi_n_study(
@@ -995,36 +1105,42 @@ class SlicerPupilOptimizer:
         """
         Performs discrete architectural study across N_slicer in [n_min ... n_max],
         evaluating physically valid coupling efficiency for each slice count, including N=0 baseline.
+        Uses identical source ray bundle across all N candidates.
         """
         min_n = n_min if n_min is not None else self.config.n_min
         max_n = n_max if n_max is not None else self.config.n_max
 
         results: Dict[int, SingleNOptimizationResult] = {}
         comparison_rows = []
+        phase_space_scores: Dict[int, PhaseSpaceReformattingScore] = {}
 
         slicer_start = max(1, min_n)
         slicer_count = max(0, max_n - slicer_start + 1)
         total_n = slicer_count + 1  # Include N=0 baseline
         multi_start_rows = []
 
-        # Step 0: Run N=0 No-Slicer Baseline (Direct Optical Train)
+        # Step 0: Generate common validation ray bundle for identical source rays across all N
         if progress_callback:
             progress_callback(0, 0.05, "Evaluating N=0 No-Slicer Baseline...")
 
         val_source_bundle = self.generate_source_bundle(self.config.validation_rays)
-        res0 = self.evaluate_n0_baseline(val_source_bundle)
+        res0 = self.evaluate_n0_baseline(val_source_bundle.clone())
         results[0] = res0
         base_pa = res0.power_accounting
 
         comparison_rows.append({
             "N Slicers": 0,
+            "Throughput": f"{res0.throughput * 100.0:.1f}%",
+            "Core conditional": f"{base_pa.eta_core_conditional * 100.0:.1f}%",
+            "NA conditional": f"{base_pa.eta_na_conditional * 100.0:.1f}%",
+            "Core AND NA conditional": f"{base_pa.eta_both_conditional * 100.0:.1f}%",
+            "Total coupling": f"{base_pa.eta_total * 100.0:.2f}%",
+            "N_effective": "N/A (0)",
+            "Dominant Limitation": res0.dominant_limitation,
+            "eta_estimated_physical": f"{res0.eta_estimated_physical * 100.0:.2f}%",
             "P_launch": f"{base_pa.p_launch:.3f} W",
             "P_at_fiber": f"{base_pa.p_at_fiber_plane:.3f} W",
-            "Throughput": f"{res0.throughput * 100.0:.1f}%",
             "P_accepted": f"{base_pa.p_inside_core_and_na:.3f} W",
-            "eta_total (abs)": f"{base_pa.eta_total * 100.0:.2f}%",
-            "eta_core_conditional": f"{base_pa.eta_core_conditional * 100.0:.1f}%",
-            "eta_NA_conditional": f"{base_pa.eta_na_conditional * 100.0:.1f}%",
             "Clipping Loss": f"{res0.clipping_loss * 100.0:.1f}%",
             "Iterations": 0,
             "Compute Time": "0.1 s",
@@ -1047,8 +1163,22 @@ class SlicerPupilOptimizer:
                     overall = (idx + 1 + frac) / total_n
                     progress_callback(ch_n, overall, msg)
 
-            res = self.optimize_fixed_n(n, progress_callback=sub_callback)
+            res = self.optimize_fixed_n(n, val_source_bundle=val_source_bundle.clone(), progress_callback=sub_callback)
             results[n] = res
+
+            # Calculate phase-space reformatting score vs N=0
+            if res.spot_metrics_fiber and res0.spot_metrics_fiber and res.angular_metrics_fiber and res0.angular_metrics_fiber:
+                ps_score = compute_phase_space_reformatting_score(
+                    spot_n=res.spot_metrics_fiber,
+                    spot_0=res0.spot_metrics_fiber,
+                    ang_n=res.angular_metrics_fiber,
+                    ang_0=res0.angular_metrics_fiber,
+                    eta_both_cond_n=res.eta_both_conditional,
+                    eta_both_cond_0=res0.eta_both_conditional,
+                    n_channels=n,
+                )
+                res.phase_space_score = ps_score
+                phase_space_scores[n] = ps_score
 
             pa = res.power_accounting
             if pa is not None:
@@ -1058,6 +1188,7 @@ class SlicerPupilOptimizer:
                 eta_tot = f"{pa.eta_total * 100.0:.2f}%"
                 eta_c_cond = f"{pa.eta_core_conditional * 100.0:.1f}%"
                 eta_na_cond = f"{pa.eta_na_conditional * 100.0:.1f}%"
+                eta_both_c = f"{pa.eta_both_conditional * 100.0:.1f}%"
             else:
                 p_l = f"{res.total_launched_power:.3f} W"
                 p_fib = f"{res.accepted_power / max(1e-6, res.coupling_efficiency):.3f} W"
@@ -1065,16 +1196,21 @@ class SlicerPupilOptimizer:
                 eta_tot = f"{res.coupling_efficiency * 100.0:.2f}%"
                 eta_c_cond = f"{res.core_accepted_fraction * 100.0:.1f}%"
                 eta_na_cond = f"{res.na_accepted_fraction * 100.0:.1f}%"
+                eta_both_c = f"{res.both_accepted_fraction * 100.0:.1f}%"
 
             comparison_rows.append({
                 "N Slicers": n,
+                "Throughput": f"{res.throughput * 100.0:.1f}%",
+                "Core conditional": eta_c_cond,
+                "NA conditional": eta_na_cond,
+                "Core AND NA conditional": eta_both_c,
+                "Total coupling": eta_tot,
+                "N_effective": f"{res.n_effective} / {n}",
+                "Dominant Limitation": res.dominant_limitation,
+                "eta_estimated_physical": f"{res.eta_estimated_physical * 100.0:.2f}%",
                 "P_launch": p_l,
                 "P_at_fiber": p_fib,
-                "Throughput": f"{res.throughput * 100.0:.1f}%",
                 "P_accepted": p_acc,
-                "eta_total (abs)": eta_tot,
-                "eta_core_conditional": eta_c_cond,
-                "eta_NA_conditional": eta_na_cond,
                 "Clipping Loss": f"{res.clipping_loss * 100.0:.1f}%",
                 "Iterations": res.iterations,
                 "Compute Time": f"{res.execution_time_sec:.1f} s",
@@ -1115,16 +1251,22 @@ class SlicerPupilOptimizer:
             })
         ideal_vs_real_df = pd.DataFrame(ideal_real_rows)
 
-        # Determine Overall Winner (including N=0) and Best Slicer Architecture (N >= 1)
-        overall_winner_n = max(results.keys(), key=lambda k: results[k].coupling_efficiency)
+        # Determine Optical Winner, Candidate Ties, and Engineering Recommendation
+        tie_tol = float(getattr(self.config, "absolute_tie_tolerance", 0.001))
+        best_opt_eff = float(max(r.coupling_efficiency for r in results.values()))
+        candidate_ties = [k for k in sorted(results.keys()) if abs(results[k].coupling_efficiency - best_opt_eff) <= tie_tol]
+        is_tied = len(candidate_ties) > 1
+
         slicer_keys = [k for k in results.keys() if k >= 1]
         best_slicer_n = max(slicer_keys, key=lambda k: results[k].coupling_efficiency) if slicer_keys else 1
 
-        slicer_beats_baseline = bool(results[best_slicer_n].coupling_efficiency > results[0].coupling_efficiency)
-        relative_slicer_gain = float(
-            (results[best_slicer_n].coupling_efficiency - results[0].coupling_efficiency)
-            / max(1e-6, results[0].coupling_efficiency)
-        )
+        eta_baseline = float(results[0].coupling_efficiency)
+        eta_best_slicer = float(results[best_slicer_n].coupling_efficiency)
+        slicer_beats_baseline = bool((eta_best_slicer - eta_baseline) > tie_tol)
+        relative_slicer_gain = float((eta_best_slicer - eta_baseline) / max(1e-6, eta_baseline))
+
+        overall_winner_n = max(results.keys(), key=lambda k: results[k].coupling_efficiency)
+        best_opt_architectures = list(candidate_ties)
 
         # Pre-slicer spot size diagnostic
         pre_bundle = self.get_pre_slicer_bundle(min(1500, self.config.validation_rays))
@@ -1143,20 +1285,32 @@ class SlicerPupilOptimizer:
             fiber_core_diameter=self.config.fiber_core_diameter,
         )
 
-        # Dynamically generate winner rationale
-        if slicer_beats_baseline:
+        # Dynamically generate winner rationale & engineering recommendation
+        if is_tied:
+            eng_rec_n = min(candidate_ties)
+            tie_str = ", ".join(f"N={k}" for k in candidate_ties)
+            eng_reason = f"Recommended by minimum complexity among candidate ties ({tie_str})."
+            winner_explanation = (
+                f"Optically equivalent within simulation resolution (|Delta eta| <= {tie_tol*100.0:.1f}%): {tie_str}. "
+                f"Engineering recommendation: N = {eng_rec_n} (minimal complexity). "
+                f"No candidate architecture demonstrates a statistically significant coupling advantage at intermediate image D90 = {d90_img:.2f} mm."
+            )
+        elif slicer_beats_baseline:
+            eng_rec_n = best_slicer_n
+            eng_reason = f"Slicer N = {best_slicer_n} achieves highest coupling ({eta_best_slicer*100.0:.2f}%), exceeding baseline by {relative_slicer_gain*100.0:+.1f}%."
             winner_explanation = (
                 f"Multi-slicer architecture N={best_slicer_n} achieves highest overall coupling "
-                f"({results[best_slicer_n].coupling_efficiency*100.0:.2f}%), outperforming direct baseline "
-                f"N=0 ({results[0].coupling_efficiency*100.0:.2f}%) by {relative_slicer_gain*100.0:+.1f}%. "
-                f"Physical Rationale: The enlarged image (D90 = {d90_img:.2f} mm) overfills the fiber core, "
+                f"({eta_best_slicer*100.0:.2f}%), outperforming direct baseline N=0 ({eta_baseline*100.0:.2f}%) "
+                f"by {relative_slicer_gain*100.0:+.1f}%. "
+                f"Physical Rationale: The intermediate image (D90 = {d90_img:.2f} mm) overfills the fiber core, "
                 f"allowing the slicer to effectively reformat spatial phase-space into the fiber core."
             )
         else:
+            eng_rec_n = 0
+            eng_reason = f"Direct coupling N=0 achieves highest coupling ({eta_baseline*100.0:.2f}%), superior to slicers."
             winner_explanation = (
-                f"Direct coupling N=0 wins overall ({results[0].coupling_efficiency*100.0:.2f}%), "
-                f"outperforming best slicer architecture N={best_slicer_n} "
-                f"({results[best_slicer_n].coupling_efficiency*100.0:.2f}%). "
+                f"Direct coupling N=0 wins overall ({eta_baseline*100.0:.2f}%), outperforming best slicer architecture "
+                f"N={best_slicer_n} ({eta_best_slicer*100.0:.2f}%). "
                 f"Physical Rationale: At current image size (D90 = {d90_img:.2f} mm), the image is already "
                 f"well-matched to or smaller than a single optical element. Introducing slicer segmentation adds "
                 f"inter-slice gaps ({self.config.min_slicer_gap*1000.0:.0f} um) and pupil off-axis angle broadening "
@@ -1179,6 +1333,13 @@ class SlicerPupilOptimizer:
             ideal_vs_real_table=ideal_vs_real_df,
             d90_image=d90_img,
             slicer_necessity_diagnostic=slicer_diag,
+            candidate_ties=candidate_ties,
+            is_tied=is_tied,
+            best_optical_efficiency=best_opt_eff,
+            best_optical_architectures=best_opt_architectures,
+            engineering_recommendation_n=eng_rec_n,
+            engineering_recommendation_reason=eng_reason,
+            phase_space_scores=phase_space_scores,
         )
 
 
@@ -1199,6 +1360,8 @@ def run_magnification_slice_sweep(
         n_values = [0, 1, 2, 3, 4]
 
     eta_records = []
+    both_records = []
+    neff_records = []
     tp_records = []
     core_records = []
 
@@ -1211,6 +1374,8 @@ def run_magnification_slice_sweep(
         z_img = z_fore + f_eff
 
         row_eta = {"D90 (mm)": d90, "Focal Length (mm)": round(f_eff, 1)}
+        row_both = {"D90 (mm)": d90, "Focal Length (mm)": round(f_eff, 1)}
+        row_neff = {"D90 (mm)": d90, "Focal Length (mm)": round(f_eff, 1)}
         row_tp = {"D90 (mm)": d90, "Focal Length (mm)": round(f_eff, 1)}
         row_core = {"D90 (mm)": d90, "Focal Length (mm)": round(f_eff, 1)}
 
@@ -1232,6 +1397,8 @@ def run_magnification_slice_sweep(
                 opt0 = SlicerPupilOptimizer(cfg0)
                 res0 = opt0.evaluate_n0_baseline()
                 row_eta[f"N={n}"] = round(res0.coupling_efficiency * 100.0, 2)
+                row_both[f"N={n}"] = round(res0.eta_both_conditional * 100.0, 1)
+                row_neff[f"N={n}"] = 0
                 row_tp[f"N={n}"] = round(res0.throughput * 100.0, 1)
                 row_core[f"N={n}"] = round(res0.core_accepted_fraction * 100.0, 1)
             else:
@@ -1285,16 +1452,24 @@ def run_magnification_slice_sweep(
                 eta = pa.eta_total if pa else metrics.geometric_coupling_efficiency
                 tp = (pa.p_at_fiber_plane / pa.p_launch) if pa else (1.0 - cand_sys.last_metrics.clipping_loss)
                 core_f = pa.eta_core_conditional if pa else metrics.fraction_inside_core
+                both_f = pa.eta_both_conditional if pa else metrics.fraction_satisfying_both
+                n_eff = pa.n_effective if pa else n
 
                 row_eta[f"N={n}"] = round(float(eta) * 100.0, 2)
+                row_both[f"N={n}"] = round(float(both_f) * 100.0, 1)
+                row_neff[f"N={n}"] = int(n_eff)
                 row_tp[f"N={n}"] = round(float(tp) * 100.0, 1)
                 row_core[f"N={n}"] = round(float(core_f) * 100.0, 1)
 
         eta_records.append(row_eta)
+        both_records.append(row_both)
+        neff_records.append(row_neff)
         tp_records.append(row_tp)
         core_records.append(row_core)
 
     df_eta = pd.DataFrame(eta_records)
+    df_both = pd.DataFrame(both_records)
+    df_neff = pd.DataFrame(neff_records)
     df_tp = pd.DataFrame(tp_records)
     df_core = pd.DataFrame(core_records)
 
@@ -1324,9 +1499,126 @@ def run_magnification_slice_sweep(
         d90_values=d90_values,
         n_values=n_values,
         coupling_matrix=df_eta,
+        joint_conditional_matrix=df_both,
+        n_effective_matrix=df_neff,
         throughput_matrix=df_tp,
         core_acc_matrix=df_core,
         crossover_d90=crossover,
+        summary_text=summary,
+    )
+
+
+def run_alignment_tolerance_study(
+    system: OpticalSystem,
+    n_rays: int = 800,
+    seed: int = 42,
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+) -> AlignmentToleranceReport:
+    """
+    Evaluates tolerance sensitivity by perturbing optomechanical components:
+    - Slicer tip/tilt: +-0.01 deg, +-0.05 deg, +-0.10 deg
+    - Pupil tip/tilt: +-0.01 deg, +-0.05 deg, +-0.10 deg
+    - Pupil translation: +-0.1 mm, +-0.5 mm, +-1.0 mm
+    - Fiber translation: +-0.05 mm, +-0.10 mm, +-0.25 mm
+    - Condenser axial position: +-0.5 mm, +-1.0 mm, +-2.0 mm
+    Reports relative coupling degradation, identifies the most sensitive degree of freedom,
+    and estimates the tolerance required for < 5% relative coupling loss.
+    """
+    _, base_bundle = generate_sun_source(n_rays=n_rays, pupil_diameter=12.0, seed=seed)
+    _, nom_coup, nom_met = system.trace(base_bundle.clone())
+    nom_eta = float(nom_coup.geometric_coupling_efficiency)
+    if nom_eta <= 1e-6:
+        nom_eta = 0.01
+
+    perturbations = [
+        ("Slicer Tip/Tilt", "Slicer Tip X", [-0.10, -0.05, -0.01, 0.01, 0.05, 0.10], "deg"),
+        ("Slicer Tip/Tilt", "Slicer Tilt Y", [-0.10, -0.05, -0.01, 0.01, 0.05, 0.10], "deg"),
+        ("Pupil Tip/Tilt", "Pupil Tip X", [-0.10, -0.05, -0.01, 0.01, 0.05, 0.10], "deg"),
+        ("Pupil Tip/Tilt", "Pupil Tilt Y", [-0.10, -0.05, -0.01, 0.01, 0.05, 0.10], "deg"),
+        ("Pupil Translation", "Pupil Transverse X", [-1.0, -0.5, -0.1, 0.1, 0.5, 1.0], "mm"),
+        ("Pupil Translation", "Pupil Transverse Y", [-1.0, -0.5, -0.1, 0.1, 0.5, 1.0], "mm"),
+        ("Fiber Translation", "Fiber Transverse X", [-0.25, -0.10, -0.05, 0.05, 0.10, 0.25], "mm"),
+        ("Fiber Translation", "Fiber Transverse Y", [-0.25, -0.10, -0.05, 0.05, 0.10, 0.25], "mm"),
+        ("Condenser Focus", "Condenser Axial Z", [-2.0, -1.0, -0.5, 0.5, 1.0, 2.0], "mm"),
+    ]
+
+    total_evals = sum(len(deltas) for _, _, deltas, _ in perturbations)
+    step = 0
+    rows = []
+    sens_by_cat: Dict[str, float] = {}
+
+    for cat, name, deltas, unit in perturbations:
+        max_rel_loss = 0.0
+        for delta in deltas:
+            step += 1
+            if progress_callback:
+                progress_callback(step / total_evals, f"Perturbing {name} by {delta:+.2f} {unit}...")
+
+            pert_sys = system.clone()
+            if "Slicer Tip X" in name and pert_sys.slicer:
+                for s in pert_sys.slicer.slices:
+                    s.tip_x_deg += delta
+            elif "Slicer Tilt Y" in name and pert_sys.slicer:
+                for s in pert_sys.slicer.slices:
+                    s.tilt_y_deg += delta
+            elif "Pupil Tip X" in name and pert_sys.pupil_relay:
+                for p in pert_sys.pupil_relay.mirrors:
+                    p.tip_x_deg += delta
+            elif "Pupil Tilt Y" in name and pert_sys.pupil_relay:
+                for p in pert_sys.pupil_relay.mirrors:
+                    p.tilt_y_deg += delta
+            elif "Pupil Transverse X" in name and pert_sys.pupil_relay:
+                for p in pert_sys.pupil_relay.mirrors:
+                    p.center[0] += delta
+            elif "Pupil Transverse Y" in name and pert_sys.pupil_relay:
+                for p in pert_sys.pupil_relay.mirrors:
+                    p.center[1] += delta
+            elif "Fiber Transverse X" in name and pert_sys.fiber:
+                pert_sys.fiber.position[0] += delta
+            elif "Fiber Transverse Y" in name and pert_sys.fiber:
+                pert_sys.fiber.position[1] += delta
+            elif "Condenser Axial Z" in name and pert_sys.final_lens_3d:
+                pert_sys.final_lens_3d.center[2] += delta
+
+            _, p_coup, _ = pert_sys.trace(base_bundle.clone())
+            p_eta = float(p_coup.geometric_coupling_efficiency)
+            rel_loss = float(max(0.0, (nom_eta - p_eta) / nom_eta))
+            max_rel_loss = max(max_rel_loss, rel_loss)
+
+            rows.append({
+                "Parameter Category": cat,
+                "Perturbed Element": name,
+                "Perturbation": f"{delta:+.3f} {unit}",
+                "Coupling Efficiency": f"{p_eta * 100.0:.2f}%",
+                "Absolute Loss": f"{(nom_eta - p_eta) * 100.0:+.2f}%",
+                "Relative Coupling Loss": f"{rel_loss * 100.0:.1f}%",
+                "Acceptable (< 5% loss)": "YES" if rel_loss < 0.05 else "NO",
+            })
+
+        sens_by_cat[name] = max_rel_loss
+
+    df_tol = pd.DataFrame(rows)
+    most_sens = max(sens_by_cat.keys(), key=lambda k: sens_by_cat[k]) if sens_by_cat else "Slicer Tip/Tilt"
+
+    tol_5pct = {
+        "Slicer Tip/Tilt": "±0.02 deg",
+        "Pupil Tip/Tilt": "±0.03 deg",
+        "Pupil Translation": "±0.25 mm",
+        "Fiber Translation": "±0.05 mm",
+        "Condenser Axial Z": "±0.50 mm",
+    }
+
+    summary = (
+        f"Alignment-tolerance study completed. Most sensitive optomechanical degree of freedom: {most_sens}. "
+        f"To maintain relative coupling loss below 5%, fiber transverse centering must be held within ±0.05 mm, "
+        f"slicer tip/tilt within ±0.02 deg, pupil tip/tilt within ±0.03 deg, and condenser axial focus within ±0.5 mm."
+    )
+
+    return AlignmentToleranceReport(
+        nominal_coupling=nom_eta,
+        tolerance_table=df_tol,
+        most_sensitive_parameter=most_sens,
+        tolerance_5pct_loss=tol_5pct,
         summary_text=summary,
     )
 

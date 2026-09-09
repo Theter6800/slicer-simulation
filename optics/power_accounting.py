@@ -131,6 +131,11 @@ class PowerAccounting:
         """Absolute physical coupling efficiency = P_inside_core_AND_NA / P_launch."""
         return float(self.p_inside_core_and_na / self.p_launch) if self.p_launch > 0 else 0.0
 
+    @property
+    def eta_both_launch(self) -> float:
+        """Absolute joint spatial core and angular NA acceptance = P_inside_core_AND_NA / P_launch."""
+        return self.eta_total
+
     # 2. Conditional efficiencies relative to power reaching fiber plane
     @property
     def eta_core_conditional(self) -> float:
@@ -156,6 +161,109 @@ class PowerAccounting:
     def eta_coupling_conditional(self) -> float:
         """Alias for eta_both_conditional."""
         return self.eta_both_conditional
+
+    def compute_n_effective(self, active_threshold: float = 0.05) -> Tuple[int, Dict[int, float], bool]:
+        """
+        Computes effective active slicer channels based on power fraction:
+        power_fraction_i = P_incident_on_slice_i / P_total_intercepted_by_slicers.
+        A channel is active if power_fraction_i >= active_threshold (default 5%).
+        Returns: (n_effective, per_slice_fractions, is_underutilized_warning).
+        """
+        if not self.slice_shares:
+            return 0, {}, False
+
+        p_intercept = self.p_intercepted_by_slicers
+        if p_intercept <= 1e-12:
+            p_intercept = sum(s.p_incident for s in self.slice_shares.values())
+
+        fractions: Dict[int, float] = {}
+        active_count = 0
+        for s_id, s_share in self.slice_shares.items():
+            frac = float(s_share.p_incident / p_intercept) if p_intercept > 1e-12 else 0.0
+            fractions[s_id] = frac
+            if frac >= active_threshold:
+                active_count += 1
+
+        n_configured = len(self.slice_shares)
+        is_warning = (active_count < n_configured) and (n_configured > 1)
+        return active_count, fractions, is_warning
+
+    @property
+    def n_effective(self) -> int:
+        """Count of active slicer channels receiving >= 5% of intercepted power."""
+        n_eff, _, _ = self.compute_n_effective(active_threshold=0.05)
+        return n_eff
+
+    @property
+    def slice_power_fractions(self) -> Dict[int, float]:
+        """Per-channel power fraction relative to total intercepted power."""
+        _, fracs, _ = self.compute_n_effective()
+        return fracs
+
+    def compute_estimated_physical_efficiency(
+        self,
+        r_slicer: float = 0.98,
+        r_pupil: float = 0.98,
+        t_lens: float = 0.96,
+        is_direct: bool = False,
+    ) -> float:
+        """
+        Calculates estimated physical efficiency incorporating realistic Fresnel and coating losses:
+        - For direct baseline (N=0): T_fore * T_condenser = t_lens * t_lens = 0.96 * 0.96 = 0.9216.
+        - For slicer systems (N >= 1): T_fore * R_slicer * R_pupil * T_condenser = 0.96 * 0.98 * 0.98 * 0.96 ~= 0.8844.
+        Returns: eta_estimated_physical = eta_total * T_physical.
+        """
+        if is_direct or len(self.slice_shares) == 0:
+            t_phys = t_lens * t_lens
+        else:
+            t_phys = t_lens * r_slicer * r_pupil * t_lens
+        return float(self.eta_total * t_phys)
+
+    def classify_dominant_limitation(self, tie_with_baseline: bool = False) -> str:
+        """
+        Classifies the dominant physical loss mechanism for the architecture:
+        - COVERAGE-LIMITED: Significant image power misses slicers (P_intercepted / P_image < 0.90)
+        - PUPIL-LIMITED: Significant power misses assigned pupil mirrors (P_pupil / P_intercepted < 0.85)
+        - CONDENSER-LIMITED: Significant power misses final coupling optic (P_condenser / P_pupil < 0.90)
+        - SPATIAL-FIBER-LIMITED: Most fiber-plane losses occur because r > 0.5 mm (eta_core < 0.70 and eta_na >= 0.85)
+        - NA-LIMITED: Most fiber-plane losses occur because theta exceeds acceptance (eta_na < 0.70 and eta_core >= 0.85)
+        - JOINT PHASE-SPACE LIMITED: Spatial and angular conditions interact strongly (both < 0.85)
+        - NO MATERIAL IMPROVEMENT: Performance statistically indistinguishable from N=0
+        """
+        if tie_with_baseline:
+            return "NO MATERIAL IMPROVEMENT"
+
+        # Check slicer coverage
+        if self.p_on_image_plane > 1e-9:
+            slic_frac = self.p_intercepted_by_slicers / self.p_on_image_plane
+            if slic_frac < 0.90:
+                return "COVERAGE-LIMITED"
+
+        # Check pupil interception
+        if self.p_intercepted_by_slicers > 1e-9:
+            pupil_in = max(1e-9, self.p_after_slicer_gaps)
+            pupil_frac = self.p_on_correct_pupil / pupil_in
+            if pupil_frac < 0.85:
+                return "PUPIL-LIMITED"
+
+        # Check condenser interception
+        p_pupil_surv = self.p_pupil_output
+        if p_pupil_surv > 1e-9:
+            cond_frac = self.p_on_condenser / p_pupil_surv
+            if cond_frac < 0.90:
+                return "CONDENSER-LIMITED"
+
+        # Fiber plane acceptance
+        c_cond = self.eta_core_conditional
+        na_cond = self.eta_na_conditional
+        if c_cond < 0.70 and na_cond >= 0.85:
+            return "SPATIAL-FIBER-LIMITED"
+        elif na_cond < 0.70 and c_cond >= 0.85:
+            return "NA-LIMITED"
+        elif c_cond < 0.85 or na_cond < 0.85:
+            return "JOINT PHASE-SPACE LIMITED"
+
+        return "OPTIMIZED"
 
     # 3. Intermediate stage loss fractions relative to P_launch
     @property
@@ -340,11 +448,17 @@ class PowerAccounting:
             "eta_core_launch": self.eta_core_launch,
             "eta_NA_launch": self.eta_na_launch,
             "eta_total": self.eta_total,
+            "eta_both_launch": self.eta_both_launch,
             # Conditional efficiencies
             "eta_core_conditional": self.eta_core_conditional,
             "eta_NA_conditional": self.eta_na_conditional,
             "eta_both_conditional": self.eta_both_conditional,
             "eta_coupling_conditional": self.eta_coupling_conditional,
+            # Effective channel metrics & physical efficiency
+            "N_effective": self.n_effective,
+            "slice_power_fractions": self.slice_power_fractions,
+            "eta_estimated_physical": self.compute_estimated_physical_efficiency(),
+            "dominant_limitation": self.classify_dominant_limitation(),
             # Conservation status
             "is_power_conserved": is_cons,
             "conservation_issues": cons_issues,

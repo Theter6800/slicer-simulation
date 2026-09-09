@@ -4,6 +4,7 @@ non-sequential 3D branched post-slicer ray tracing.
 """
 
 from __future__ import annotations
+import copy
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, Tuple
 import numpy as np
@@ -121,6 +122,10 @@ class OpticalSystem:
                     return float(elem.z + elem.focal_length)
             return float(self.fore_optics[-1].z + 50.0)
         return 190.0
+
+    def clone(self) -> OpticalSystem:
+        """Deep copy of optical system for perturbation or branch tracing."""
+        return copy.deepcopy(self)
 
     def trace(self, initial_bundle: RayBundle) -> Tuple[RayBundle, FiberCouplingResult, SystemMetrics]:
         bundle = initial_bundle.clone()

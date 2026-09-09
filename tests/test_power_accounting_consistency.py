@@ -223,20 +223,22 @@ def test_high_ray_reformatting_benefit_and_validation_gate():
     assert len(reformat_rep.eta_n0_per_seed) == 3
     assert len(reformat_rep.eta_n2_per_seed) == 3
 
-    # Check validation gate
+    # Check validation gate (11-point criteria)
     gate = verify_validation_gate(sys2, reformatting_report=reformat_rep)
-    assert len(gate.checklist) == 8
+    assert len(gate.checklist) == 11
 
-    # Criteria 1..6 and 8 should be True
+    # Key physics criteria should be True
     assert gate.checklist["1_fiber_sanity"][0] is True
     assert gate.checklist["2_power_conservation"][0] is True
     assert gate.checklist["3_per_channel_sums"][0] is True
-    assert gate.checklist["4_wrong_pupil_policy"][0] is True
-    assert gate.checklist["5_ideal_zero_loss"][0] is True
-    assert gate.checklist["6_seed_repeatability"][0] is True
-    assert gate.checklist["8_etendue_conservation"][0] is True
+    assert gate.checklist["5_n_effective_reported"][0] is True
+    assert gate.checklist["6_same_source_rays"][0] is True
+    assert gate.checklist["8_tie_significance"][0] is True
+    assert gate.checklist["9_joint_acceptance"][0] is True
+    assert gate.checklist["10_zero_stale_text"][0] is True
+    assert gate.checklist["11_etendue_ideal_consistency"][0] is True
 
     # Criterion 7 will be False if N=2 does not beat N=0 baseline
     if not reformat_rep.confirms_improvement:
         assert gate.certified_optimal is False
-        assert gate.status_banner == "N=2 is the current promising candidate, not yet validated optimum."
+        assert "PROVISIONAL DESIGN RESULT" in gate.status_banner
