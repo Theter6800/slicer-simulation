@@ -312,8 +312,8 @@ if "optimizer_study" not in st.session_state:
     st.session_state.optimizer_study = None
 else:
     st.session_state.optimizer_study = ensure_study_compatibility(st.session_state.optimizer_study)
-if "optimizer_selected_n" not in st.session_state:
-    st.session_state.optimizer_selected_n = None
+if "optimizer_selected_n" not in st.session_state or st.session_state.optimizer_selected_n is None:
+    st.session_state.optimizer_selected_n = 2
 if "n_channels" not in st.session_state:
     st.session_state.n_channels = 2
 if "preset_name" not in st.session_state:
@@ -1876,9 +1876,9 @@ if st.session_state.app_mode == "Simulation-to-Lab Output":
     current_sys = get_current_system()
     render_simulation_to_lab_view(
         current_sys,
-        fore_focal_opt=float(st.session_state.get("fore_focal_opt", 150.0)),
+        fore_focal_opt=float(st.session_state.get("fore_focal_opt") or 150.0),
         fore_lens_z=40.0,
-        n_channels=int(st.session_state.get("n_channels", 2)),
+        n_channels=int(st.session_state.get("n_channels") or 2),
     )
     st.stop()
 
@@ -1903,14 +1903,17 @@ if st.session_state.app_mode == "Architecture Design Optimizer":
     # --------------------------------------------------
     # TOP STATUS PANEL: OPTIMIZATION VARIABLES & BOUNDS (Directive 14)
     # --------------------------------------------------
-    cur_f_fore_val = float(st.session_state.get("fore_focal_opt", 150.0))
-    cur_f_cond_val = float(st.session_state.get("condenser_focal_length", 22.0))
-    cur_n_val = int(st.session_state.get("optimizer_selected_n", 2))
+    cur_f_fore_val = float(st.session_state.get("fore_focal_opt") or 150.0)
+    cur_f_cond_val = float(st.session_state.get("condenser_focal_length") or 22.0)
+    cur_n_raw = st.session_state.get("optimizer_selected_n")
+    cur_n_val = int(cur_n_raw) if cur_n_raw is not None else 2
+    cur_seed_raw = st.session_state.get("opt_seed") or st.session_state.get("random_seed")
+    cur_seed_val = int(cur_seed_raw) if cur_seed_raw is not None else 42
     panel_cfg = OptimizationConfig(
         fore_focal_length=cur_f_fore_val,
         condenser_focal_length=cur_f_cond_val,
-        source_mode=st.session_state.get("source_mode", "SUN"),
-        random_seed=int(st.session_state.get("opt_seed", 42)),
+        source_mode=str(st.session_state.get("source_mode") or "SUN"),
+        random_seed=cur_seed_val,
     )
     with st.expander("Optimization Variables & Bounds (Mandatory Classification)", expanded=True):
         st.caption("All simulator parameters are explicitly classified into 4 distinct physical categories. Slicer aperture is permanently locked at 10.0 mm x 10.0 mm.")
@@ -1956,9 +1959,9 @@ if st.session_state.app_mode == "Architecture Design Optimizer":
     # --------------------------------------------------
     # 0. ANALYTICAL OPTICAL CHECKS & SENSITIVITY PRE-CHECK
     # --------------------------------------------------
-    cur_f_fore = float(st.session_state.get("fore_focal_opt", 150.0))
-    cur_f_cond = float(st.session_state.get("condenser_focal_length", 22.0))
-    calc_d_img = 2.0 * cur_f_fore * np.tan(np.radians(0.266)) if st.session_state.get("source_mode", "SUN") == "SUN" else 1.5
+    cur_f_fore = float(st.session_state.get("fore_focal_opt") or 150.0)
+    cur_f_cond = float(st.session_state.get("condenser_focal_length") or 22.0)
+    calc_d_img = 2.0 * cur_f_fore * np.tan(np.radians(0.266)) if (st.session_state.get("source_mode") or "SUN") == "SUN" else 1.5
 
     st.markdown("### 0. Fundamental Analytical Optical Checks & Étendue Limits")
     checks = compute_analytical_optical_checks(
@@ -2063,7 +2066,7 @@ if st.session_state.app_mode == "Architecture Design Optimizer":
                     "Target Image Diameter D90 on Slicer (mm)",
                     min_value=1.0,
                     max_value=40.0,
-                    value=float(st.session_state.get("target_d90_mm", 1.3)),
+                    value=float(st.session_state.get("target_d90_mm") or 1.3),
                     step=0.5,
                     help="Design variable: Scales fore-optics focal length to achieve desired intermediate image size.",
                 )
@@ -2079,10 +2082,12 @@ if st.session_state.app_mode == "Architecture Design Optimizer":
         else:
             hw_c1, hw_c2, hw_c3 = st.columns(3)
             with hw_c1:
+                cur_hl1 = st.session_state.get("hardware_lens1") or 100.0
+                hl1_idx = AVAILABLE_HARDWARE_FOCAL_LENGTHS.index(cur_hl1) if cur_hl1 in AVAILABLE_HARDWARE_FOCAL_LENGTHS else 0
                 lens1_val = st.selectbox(
                     "Fore Lens 1 Focal Length (mm)",
                     AVAILABLE_HARDWARE_FOCAL_LENGTHS,
-                    index=AVAILABLE_HARDWARE_FOCAL_LENGTHS.index(st.session_state.get("hardware_lens1", 100.0)),
+                    index=hl1_idx,
                     help="Available laboratory lens catalog",
                 )
                 st.session_state.hardware_lens1 = lens1_val
@@ -2110,7 +2115,7 @@ if st.session_state.app_mode == "Architecture Design Optimizer":
                 st.metric("Strict Locked Slicer Plane (z_slicer)", f"{z_slicer_locked:.1f} mm")
 
             if st.button("Search Best Lab Lens Combination for Target D90", use_container_width=True):
-                t_d = float(st.session_state.get("target_d90_mm", 1.3))
+                t_d = float(st.session_state.get("target_d90_mm") or 1.3)
                 best_hw_cfg, hw_d90, hw_err = optimize_hardware_fore_optics(t_d)
                 st.success(
                     f"Optimal Laboratory Hardware Found: Lens 1 = {best_hw_cfg.lens1_focal} mm, "
@@ -2153,7 +2158,7 @@ if st.session_state.app_mode == "Architecture Design Optimizer":
         with opt_c2:
             condenser_focal_opt = st.number_input(
                 "Condenser Lens Focal Length (mm)",
-                value=float(st.session_state.get("condenser_focal_length", 22.0)),
+                value=float(st.session_state.get("condenser_focal_length") or 22.0),
                 step=1.0,
                 min_value=15.0,
                 max_value=60.0,
@@ -2171,13 +2176,13 @@ if st.session_state.app_mode == "Architecture Design Optimizer":
         with opt_c3:
             pupil_dist_opt = st.number_input(
                 "Pupil Mirror Distance L (mm)",
-                value=float(st.session_state.get("pupil_dist", 40.0)),
+                value=float(st.session_state.get("pupil_dist") or 40.0),
                 step=5.0,
                 help="Axial distance from slicer plane to pupil mirrors.",
             )
             pupil_offset_opt = st.number_input(
                 "Pupil Transverse Offset (mm)",
-                value=float(st.session_state.get("pupil_transverse_offset", 20.0)),
+                value=float(st.session_state.get("pupil_transverse_offset") or 20.0),
                 step=5.0,
                 help="Transverse distance from optical axis to pupil cluster.",
             )
@@ -2191,7 +2196,8 @@ if st.session_state.app_mode == "Architecture Design Optimizer":
                 index=0,
                 help="Differential Evolution global search budget followed by Nelder-Mead polishing.",
             )
-            opt_seed = st.number_input("Deterministic Random Seed", value=int(st.session_state.get("random_seed", 42)), step=1)
+            cur_rseed = st.session_state.get("random_seed")
+            opt_seed = st.number_input("Deterministic Random Seed", value=int(cur_rseed) if cur_rseed is not None else 42, step=1)
 
         run_opt_btn = st.button("Run Architecture Optimization Study", type="primary", use_container_width=True)
 
@@ -2679,7 +2685,9 @@ if st.session_state.app_mode == "Architecture Design Optimizer":
         st.divider()
         st.markdown("### 9. Candidate Architecture Detailed Inspection & 16-Stage Power Accounting")
         ch_list = list(study.results.keys())
-        default_sel_idx = ch_list.index(st.session_state.get("optimizer_selected_n", winner_n)) if st.session_state.get("optimizer_selected_n", winner_n) in ch_list else 0
+        cur_sel_n = st.session_state.get("optimizer_selected_n")
+        default_sel_val = cur_sel_n if cur_sel_n is not None and cur_sel_n in ch_list else winner_n
+        default_sel_idx = ch_list.index(default_sel_val) if default_sel_val in ch_list else 0
         selected_insp_n = st.radio(
             "Select Architecture to Inspect",
             ch_list,
@@ -2973,9 +2981,9 @@ with tab_supervisor:
 with tab_lab:
     render_simulation_to_lab_view(
         current_system,
-        fore_focal_opt=float(st.session_state.get("fore_focal_opt", 150.0)),
+        fore_focal_opt=float(st.session_state.get("fore_focal_opt") or 150.0),
         fore_lens_z=40.0,
-        n_channels=int(st.session_state.get("n_channels", 2)),
+        n_channels=int(st.session_state.get("n_channels") or 2),
     )
 
 # --------------------------------------------------

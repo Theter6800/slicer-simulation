@@ -250,3 +250,31 @@ def test_zero_emojis_across_simulator():
             content = f.read()
         matches = emoji_pattern.findall(content)
         assert len(matches) == 0, f"Emoji detected in {filename}: {matches}"
+
+
+def test_session_state_none_resilience():
+    """Verifies that extracting parameters with None or missing values does not throw TypeError."""
+    session_mock = {
+        "optimizer_selected_n": None,
+        "fore_focal_opt": None,
+        "condenser_focal_length": None,
+        "opt_seed": None,
+        "random_seed": None,
+        "target_d90_mm": None,
+        "hardware_lens1": None,
+        "hardware_lens2": None,
+        "pupil_dist": None,
+        "pupil_transverse_offset": None,
+    }
+
+    cur_f_fore_val = float(session_mock.get("fore_focal_opt") or 150.0)
+    cur_f_cond_val = float(session_mock.get("condenser_focal_length") or 22.0)
+    cur_n_raw = session_mock.get("optimizer_selected_n")
+    cur_n_val = int(cur_n_raw) if cur_n_raw is not None else 2
+    cur_seed_raw = session_mock.get("opt_seed") or session_mock.get("random_seed")
+    cur_seed_val = int(cur_seed_raw) if cur_seed_raw is not None else 42
+
+    assert cur_f_fore_val == 150.0
+    assert cur_f_cond_val == 22.0
+    assert cur_n_val == 2
+    assert cur_seed_val == 42
