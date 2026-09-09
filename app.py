@@ -400,6 +400,13 @@ with top_mode_c1:
         st.session_state.app_mode = top_mode
         st.rerun()
 
+with top_mode_c2:
+    st.caption("Deployment: `main` (Latest Build)")
+    if st.button("Reset State", help="Clears cached session variables and reloads default parameters", use_container_width=True):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        st.rerun()
+
 # ==========================================
 # SIDEBAR CONTROLS
 # ==========================================
@@ -505,7 +512,8 @@ with st.sidebar:
     st.caption(
         "Coordinate Conventions:\n"
         "- Pre-slicer: Nominal input axis (+z)\n"
-        "- Post-slicer: Asymmetric one-sided relay onto NEW optical axis"
+        "- Post-slicer: Asymmetric one-sided relay onto NEW optical axis\n\n"
+        "Deployment: `origin/main` | Release: `2026.09-v2`"
     )
 
 # ==========================================
