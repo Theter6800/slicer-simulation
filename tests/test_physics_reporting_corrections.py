@@ -285,3 +285,31 @@ def test_legacy_study_compatibility():
     assert hasattr(patched, "engineering_recommendation_n")
     assert hasattr(patched, "best_optical_efficiency")
     assert patched.engineering_recommendation_n == 0
+
+
+def test_power_accounting_p_at_fiber_alias():
+    """Verify that PowerAccounting supports p_at_fiber alias for p_at_fiber_plane."""
+    from optics.power_accounting import PowerAccounting
+
+    pa = PowerAccounting(
+        p_launch=1.0,
+        p_after_aperture=1.0,
+        p_on_image_plane=1.0,
+        p_intercepted_by_slicers=0.9,
+        p_lost_at_slicer_gaps=0.05,
+        p_missed_slicer_array=0.05,
+        p_on_correct_pupil=0.85,
+        p_on_wrong_pupil=0.0,
+        p_missed_all_pupils=0.05,
+        p_blocked_by_other_optics=0.0,
+        p_on_condenser=0.85,
+        p_missed_condenser=0.0,
+        p_at_fiber_plane=0.85,
+        p_inside_core=0.5,
+        p_inside_na=0.6,
+        p_inside_core_and_na=0.45,
+    )
+    assert hasattr(pa, "p_at_fiber")
+    assert pa.p_at_fiber == 0.85
+    assert pa.p_at_fiber_plane == 0.85
+

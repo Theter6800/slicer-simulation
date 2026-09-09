@@ -256,6 +256,9 @@ def ensure_study_compatibility(study: Any) -> Any:
                     setattr(r, "eta_estimated_physical", getattr(r, "coupling_efficiency", 0.0) * 0.92)
                 if not hasattr(r, "dominant_limitation"):
                     setattr(r, "dominant_limitation", "NO MATERIAL IMPROVEMENT")
+                pa = getattr(r, "power_accounting", None)
+                if pa is not None and not hasattr(pa, "p_at_fiber"):
+                    setattr(pa, "p_at_fiber", getattr(pa, "p_at_fiber_plane", 0.0))
 
         win_n = getattr(study, "overall_winner_n", 0)
         best_eff = max(effs.values()) if effs else 0.0
@@ -2281,16 +2284,25 @@ if st.session_state.app_mode == "Architecture Design Optimizer":
             )
             ps_rows = []
             for n_val, sc in study.phase_space_scores.items():
+                sc_details = getattr(sc, "details", {})
+                r_rms_v = getattr(sc, "r_rms", sc_details.get("RMS_r_N", sc_details.get("R90_N", 0.0)))
+                r_90_v = getattr(sc, "r_90", sc_details.get("R90_N", 0.0))
+                th_rms_v = getattr(sc, "theta_rms_deg", sc_details.get("RMS_theta_N", sc_details.get("theta90_N", 0.0)))
+                th_90_v = getattr(sc, "theta_90_deg", sc_details.get("theta90_N", 0.0))
+                d_r90_v = getattr(sc, "delta_r_90_vs_n0", getattr(sc, "delta_r90_mm", 0.0))
+                d_th90_v = getattr(sc, "delta_theta_90_deg_vs_n0", getattr(sc, "delta_theta90_deg", 0.0))
+                d_eta_v = getattr(sc, "delta_eta_both_cond_vs_n0", getattr(sc, "delta_eta_both_conditional", 0.0))
+                diag_v = getattr(sc, "diagnosis", getattr(sc, "interpretation", ""))
                 ps_rows.append({
                     "Architecture": f"N = {n_val}",
-                    "r_RMS (mm)": f"{sc.r_rms:.3f}",
-                    "R_90 (mm)": f"{sc.r_90:.3f}",
-                    "θ_RMS (deg)": f"{sc.theta_rms_deg:.2f}°",
-                    "θ_90 (deg)": f"{sc.theta_90_deg:.2f}°",
-                    "ΔR_90 vs N=0 (mm)": f"{sc.delta_r_90_vs_n0:+.3f}",
-                    "Δθ_90 vs N=0 (deg)": f"{sc.delta_theta_90_deg_vs_n0:+.2f}°",
-                    "Δη_both_cond vs N=0": f"{sc.delta_eta_both_cond_vs_n0*100.0:+.2f}%",
-                    "Diagnosis": sc.diagnosis,
+                    "r_RMS (mm)": f"{r_rms_v:.3f}",
+                    "R_90 (mm)": f"{r_90_v:.3f}",
+                    "θ_RMS (deg)": f"{th_rms_v:.2f}°",
+                    "θ_90 (deg)": f"{th_90_v:.2f}°",
+                    "ΔR_90 vs N=0 (mm)": f"{d_r90_v:+.3f}",
+                    "Δθ_90 vs N=0 (deg)": f"{d_th90_v:+.2f}°",
+                    "Δη_both_cond vs N=0": f"{d_eta_v*100.0:+.2f}%",
+                    "Diagnosis": diag_v,
                 })
             st.dataframe(pd.DataFrame(ps_rows), use_container_width=True)
 
@@ -2298,7 +2310,14 @@ if st.session_state.app_mode == "Architecture Design Optimizer":
         st.caption("Compares conditional fiber phase-space acceptance and mechanical clipping losses as a function of slice count:")
         fig_reformat = render_reformatting_vs_clipping_figure(study)
         st.plotly_chart(fig_reformat, use_container_width=True)
-        cond_effs = [r.power_accounting.eta_coupling_conditional * 100.0 for r in study.results.values() if r.power_accounting.p_at_fiber > 0]
+        cond_effs = []
+        for r in getattr(study, "results", getattr(study, "results_by_n", {})).values():
+            pa = getattr(r, "power_accounting", None)
+            if pa is not None:
+                p_fib = getattr(pa, "p_at_fiber_plane", getattr(pa, "p_at_fiber", 0.0))
+                if p_fib > 0:
+                    cond_eff = getattr(pa, "eta_coupling_conditional", getattr(pa, "eta_both_conditional", 0.0))
+                    cond_effs.append(cond_eff * 100.0)
         cond_range_str = f"{min(cond_effs):.1f}% - {max(cond_effs):.1f}%" if cond_effs else "N/A"
         st.markdown(
             "**Reformatting vs. Clipping Physics Takeaway:**\n"

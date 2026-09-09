@@ -100,6 +100,15 @@ class PowerAccounting:
     def p_on_final_lens(self) -> float:
         return self.p_on_condenser
 
+    @property
+    def p_at_fiber(self) -> float:
+        return self.p_at_fiber_plane
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "p_at_fiber":
+            return getattr(self, "p_at_fiber_plane", 0.0)
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
     # 1. Efficiencies relative to total launched power (Absolute System Metrics)
     @property
     def eta_slicer_launch(self) -> float:
