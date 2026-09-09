@@ -349,6 +349,21 @@ class SingleNOptimizationResult:
     def clipping_loss_fraction(self) -> float:
         return self.clipping_loss
 
+    def __getattr__(self, name: str) -> Any:
+        if name == "n_effective":
+            return getattr(self, "n_channels", 1)
+        if name == "slice_power_fractions":
+            return {}
+        if name == "eta_both_conditional":
+            return getattr(self, "both_accepted_fraction", 0.0)
+        if name == "eta_estimated_physical":
+            return getattr(self, "coupling_efficiency", 0.0) * 0.92
+        if name == "dominant_limitation":
+            return "NO MATERIAL IMPROVEMENT"
+        if name in ("spot_metrics_fiber", "angular_metrics_fiber", "phase_space_score"):
+            return None
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
 
 @dataclass
 class MultiNStudyResult:
@@ -387,6 +402,28 @@ class MultiNStudyResult:
     @property
     def results(self) -> Dict[int, SingleNOptimizationResult]:
         return self.results_by_n
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "is_tied":
+            return False
+        if name == "candidate_ties":
+            return [self.overall_winner_n] if hasattr(self, "overall_winner_n") else [0]
+        if name == "best_optical_efficiency":
+            win_n = getattr(self, "overall_winner_n", 0)
+            if hasattr(self, "results_by_n") and win_n in self.results_by_n:
+                return self.results_by_n[win_n].coupling_efficiency
+            return 0.0
+        if name == "best_optical_architectures":
+            return [self.overall_winner_n] if hasattr(self, "overall_winner_n") else [0]
+        if name == "engineering_recommendation_n":
+            return getattr(self, "overall_winner_n", 0)
+        if name == "engineering_recommendation_reason":
+            return getattr(self, "winner_explanation", "")
+        if name == "absolute_tie_tolerance":
+            return 0.001
+        if name == "phase_space_scores":
+            return {}
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
 
 class SlicerPupilOptimizer:

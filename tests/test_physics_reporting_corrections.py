@@ -266,3 +266,22 @@ def test_alignment_tolerance_study():
     assert len(report.tolerance_5pct_loss) > 0
     assert report.most_sensitive_parameter != ""
     assert len(report.tolerance_table) > 0
+
+
+def test_legacy_study_compatibility():
+    """Verify that ensure_study_compatibility dynamically patches legacy objects missing is_tied."""
+    from app import ensure_study_compatibility
+
+    class LegacyStudy:
+        def __init__(self):
+            self.overall_winner_n = 0
+            self.results = {}
+
+    legacy = LegacyStudy()
+    patched = ensure_study_compatibility(legacy)
+    assert hasattr(patched, "is_tied")
+    assert patched.is_tied is False
+    assert hasattr(patched, "candidate_ties")
+    assert hasattr(patched, "engineering_recommendation_n")
+    assert hasattr(patched, "best_optical_efficiency")
+    assert patched.engineering_recommendation_n == 0

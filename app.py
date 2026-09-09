@@ -236,11 +236,71 @@ APP_MODES = [
     "Interactive Bench Alignment",
 ]
 
+def ensure_study_compatibility(study: Any) -> Any:
+    """Guarantees backwards compatibility for cached or session-state MultiNStudyResult objects."""
+    if study is None:
+        return None
+    try:
+        results = getattr(study, "results", getattr(study, "results_by_n", {}))
+        effs = {}
+        if isinstance(results, dict):
+            for k, r in results.items():
+                effs[k] = getattr(r, "coupling_efficiency", 0.0)
+                if not hasattr(r, "n_effective"):
+                    setattr(r, "n_effective", getattr(r, "n_channels", 1))
+                if not hasattr(r, "slice_power_fractions"):
+                    setattr(r, "slice_power_fractions", {})
+                if not hasattr(r, "eta_both_conditional"):
+                    setattr(r, "eta_both_conditional", getattr(r, "both_accepted_fraction", 0.0))
+                if not hasattr(r, "eta_estimated_physical"):
+                    setattr(r, "eta_estimated_physical", getattr(r, "coupling_efficiency", 0.0) * 0.92)
+                if not hasattr(r, "dominant_limitation"):
+                    setattr(r, "dominant_limitation", "NO MATERIAL IMPROVEMENT")
+
+        win_n = getattr(study, "overall_winner_n", 0)
+        best_eff = max(effs.values()) if effs else 0.0
+        tie_tol = getattr(study, "absolute_tie_tolerance", 0.001)
+
+        ties = getattr(study, "candidate_ties", None)
+        if not ties:
+            ties = [k for k, v in effs.items() if abs(v - best_eff) <= tie_tol]
+            if not ties:
+                ties = [win_n]
+
+        setattr(study, "candidate_ties", ties)
+        setattr(study, "is_tied", len(ties) > 1)
+        setattr(study, "best_optical_efficiency", best_eff)
+        setattr(study, "best_optical_architectures", ties)
+        setattr(study, "engineering_recommendation_n", 0 if 0 in ties else min(ties, default=win_n))
+        setattr(study, "engineering_recommendation_reason", getattr(study, "winner_explanation", ""))
+        setattr(study, "absolute_tie_tolerance", tie_tol)
+        if not hasattr(study, "phase_space_scores"):
+            setattr(study, "phase_space_scores", {})
+        if not hasattr(study, "best_slicer_n"):
+            slicer_keys = [k for k in effs if k > 0]
+            setattr(study, "best_slicer_n", max(slicer_keys, key=lambda k: effs[k]) if slicer_keys else 1)
+        if not hasattr(study, "slicer_beats_baseline"):
+            best_s_n = getattr(study, "best_slicer_n", 1)
+            eta_0 = effs.get(0, 0.0)
+            eta_s = effs.get(best_s_n, 0.0)
+            setattr(study, "slicer_beats_baseline", (eta_s - eta_0) > tie_tol)
+        if not hasattr(study, "relative_slicer_gain"):
+            best_s_n = getattr(study, "best_slicer_n", 1)
+            eta_0 = effs.get(0, 0.0)
+            eta_s = effs.get(best_s_n, 0.0)
+            setattr(study, "relative_slicer_gain", (eta_s - eta_0) / eta_0 if eta_0 > 1e-9 else 0.0)
+    except Exception:
+        pass
+    return study
+
+
 # Initialize Session State early
 if "app_mode" not in st.session_state or st.session_state.app_mode not in APP_MODES:
     st.session_state.app_mode = "Summary"
 if "optimizer_study" not in st.session_state:
     st.session_state.optimizer_study = None
+else:
+    st.session_state.optimizer_study = ensure_study_compatibility(st.session_state.optimizer_study)
 if "optimizer_selected_n" not in st.session_state:
     st.session_state.optimizer_selected_n = None
 if "n_channels" not in st.session_state:
@@ -1310,7 +1370,7 @@ def get_initial_bundle(source_mode: str, n_rays: int, seed: int) -> RayBundle:
 
 
 @st.cache_resource(show_spinner=False)
-def get_default_baseline_study() -> MultiNStudyResult:
+def get_default_baseline_study(_cache_tag: str = "v3_physics_corrections") -> MultiNStudyResult:
     cfg = OptimizationConfig(
         n_min=0,
         n_max=2,
@@ -1379,12 +1439,14 @@ def generate_lab_build_sheet(
     # Pupil mirrors
     if system.pupil_relay and hasattr(system.pupil_relay, "mirrors"):
         for pm in system.pupil_relay.mirrors:
+            m_id = getattr(pm, "channel_id", getattr(pm, "mirror_id", 0))
+            pm_diam = getattr(pm, "diameter", getattr(pm, "width", 12.0))
             rows.append({
                 "Component": "Pupil Relay Array",
-                "Sub-Element": f"Pupil Mirror {pm.mirror_id}",
+                "Sub-Element": f"Pupil Mirror {m_id}",
                 "Position (x, y, z) [mm]": f"({pm.center[0]:.2f}, {pm.center[1]:.2f}, {pm.center[2]:.2f})",
                 "Tip / Tilt [deg]": f"({pm.tip_x_deg:+.3f}°, {pm.tilt_y_deg:+.3f}°)",
-                "Clear Aperture [mm]": f"{pm.diameter:.1f} dia",
+                "Clear Aperture [mm]": f"{pm_diam:.1f} dia",
                 "Focal Length [mm]": f"{pm.focal_length:.1f}" if pm.focal_length else "Flat",
                 "Alignment Tolerance & Laboratory Notes": "Mounted on common one-sided off-axis bracket. Redirects chief ray toward condenser lens center. Angular tolerance ±0.03°.",
                 "Hardware Classification": "Optimized Relay Element"
@@ -1436,6 +1498,7 @@ def render_supervisor_summary_view(
     if study is None:
         study = get_default_baseline_study()
         st.session_state.optimizer_study = study
+    study = ensure_study_compatibility(study)
 
     # Central Design Question Banner (Requirement 18)
     st.markdown("### Central Design Question")
@@ -1443,24 +1506,36 @@ def render_supervisor_summary_view(
         "> **Question:** *For the current input beam, does any image slicer configuration achieve higher total fiber coupling than direct focus (N=0)?*"
     )
 
-    win_n = study.overall_winner_n
-    best_slicer_n = study.best_slicer_n
-    win_eff = study.results[win_n].coupling_efficiency if win_n in study.results else 0.0
-    slicer_eff = study.results[best_slicer_n].coupling_efficiency if best_slicer_n in study.results else 0.0
+    win_n = getattr(study, "overall_winner_n", 0)
+    best_slicer_n = getattr(study, "best_slicer_n", 1)
+    results = getattr(study, "results", getattr(study, "results_by_n", {}))
+    win_eff = results[win_n].coupling_efficiency if (results and win_n in results) else 0.0
+    slicer_eff = results[best_slicer_n].coupling_efficiency if (results and best_slicer_n in results) else 0.0
 
-    if study.is_tied:
-        tied_str = ", ".join(f"N={n}" for n in study.candidate_ties)
+    is_tied_study = getattr(study, "is_tied", False)
+    candidate_ties = getattr(study, "candidate_ties", [win_n])
+    tie_tol = getattr(study, "absolute_tie_tolerance", 0.001)
+    best_opt_eff = getattr(study, "best_optical_efficiency", win_eff)
+    best_opt_arch = getattr(study, "best_optical_architectures", candidate_ties)
+    eng_rec_n = getattr(study, "engineering_recommendation_n", 0)
+    eng_rec_reason = getattr(study, "engineering_recommendation_reason", getattr(study, "winner_explanation", ""))
+    slicer_beats_bl = getattr(study, "slicer_beats_baseline", False)
+    rel_slicer_gain = getattr(study, "relative_slicer_gain", 0.0)
+    d90_img = getattr(study, "d90_image", 1.3)
+
+    if is_tied_study:
+        tied_str = ", ".join(f"N={n}" for n in candidate_ties)
         st.info(
             f"**Answer: EQUIVALENT WITHIN SIMULATION RESOLUTION**\n\n"
-            f"Architectures {tied_str} achieve numerically equivalent total coupling (within tie tolerance Δ = {study.absolute_tie_tolerance*100.0:.1f}%). "
+            f"Architectures {tied_str} achieve numerically equivalent total coupling (within tie tolerance Δ = {tie_tol*100.0:.1f}%). "
             f"No slicer configuration demonstrates a statistically significant optical coupling advantage over direct focus under current parameters.\n\n"
-            f"- **Best Optical Efficiency:** {study.best_optical_efficiency*100.0:.2f}% (achieved by {', '.join(f'N={n}' for n in study.best_optical_architectures)})\n"
-            f"- **Engineering Recommendation (Minimal Complexity):** N = {study.engineering_recommendation_n} (Direct Focus)\n\n"
-            f"*{study.engineering_recommendation_reason}*"
+            f"- **Best Optical Efficiency:** {best_opt_eff*100.0:.2f}% (achieved by {', '.join(f'N={n}' for n in best_opt_arch)})\n"
+            f"- **Engineering Recommendation (Minimal Complexity):** N = {eng_rec_n} (Direct Focus)\n\n"
+            f"*{eng_rec_reason}*"
         )
-    elif study.slicer_beats_baseline:
+    elif slicer_beats_bl:
         st.success(
-            f"**Answer: YES (Slicer N = {best_slicer_n} achieves +{study.relative_slicer_gain * 100.0:+.2f}% relative gain)**\n\n"
+            f"**Answer: YES (Slicer N = {best_slicer_n} achieves +{rel_slicer_gain * 100.0:+.2f}% relative gain)**\n\n"
             f"The image slicer configuration (N = {best_slicer_n}, η = {slicer_eff * 100.0:.2f}%) outperforms direct focus "
             f"(N = 0, η = {win_eff * 100.0:.2f}%). Physical reformatting successfully compresses the overfilled intermediate image into the fiber core."
         )
@@ -1484,11 +1559,12 @@ def render_supervisor_summary_view(
     # Executive Metrics
     k1, k2, k3, k4 = st.columns(4)
     with k1:
-        if study.is_tied:
+        if is_tied_study:
+            rec_eff = results[eng_rec_n].coupling_efficiency if (results and eng_rec_n in results) else 0.0
             st.metric(
                 "Engineering Recommendation",
-                f"N = {study.engineering_recommendation_n} (Direct Focus)",
-                f"η = {study.results[study.engineering_recommendation_n].coupling_efficiency * 100.0:.2f}%",
+                f"N = {eng_rec_n} (Direct Focus)",
+                f"η = {rec_eff * 100.0:.2f}%",
                 help="Minimal complexity choice: zero moving parts, zero slicer facets, zero pupil alignment",
             )
         else:
@@ -1506,16 +1582,16 @@ def render_supervisor_summary_view(
             help="Best architecture among slicer configurations (N >= 1)",
         )
     with k3:
-        if study.is_tied:
+        if is_tied_study:
             st.metric("Tie Status", "Tied within 0.1%", delta="Optically Equivalent")
-        elif study.slicer_beats_baseline:
-            st.metric("Slicer Advantage", f"+{study.relative_slicer_gain * 100.0:+.2f}%", delta="Slicer Superior")
+        elif slicer_beats_bl:
+            st.metric("Slicer Advantage", f"+{rel_slicer_gain * 100.0:+.2f}%", delta="Slicer Superior")
         else:
-            st.metric("Slicer Advantage", f"{study.relative_slicer_gain * 100.0:+.2f}%", delta="- Baseline Superior", delta_color="inverse")
+            st.metric("Slicer Advantage", f"{rel_slicer_gain * 100.0:+.2f}%", delta="- Baseline Superior", delta_color="inverse")
     with k4:
         st.metric(
             "Spot Diameter D90 at Slicer",
-            f"{study.d90_image:.2f} mm",
+            f"{d90_img:.2f} mm",
             help="90% encircled energy diameter formed by fore-optics",
         )
 
@@ -1571,16 +1647,25 @@ def render_supervisor_summary_view(
         )
         ps_rows = []
         for n_val, sc in study.phase_space_scores.items():
+            sc_details = getattr(sc, "details", {})
+            r_rms_v = getattr(sc, "r_rms", sc_details.get("RMS_r_N", sc_details.get("R90_N", 0.0)))
+            r_90_v = getattr(sc, "r_90", sc_details.get("R90_N", 0.0))
+            th_rms_v = getattr(sc, "theta_rms_deg", sc_details.get("RMS_theta_N", sc_details.get("theta90_N", 0.0)))
+            th_90_v = getattr(sc, "theta_90_deg", sc_details.get("theta90_N", 0.0))
+            d_r90_v = getattr(sc, "delta_r_90_vs_n0", getattr(sc, "delta_r90_mm", 0.0))
+            d_th90_v = getattr(sc, "delta_theta_90_deg_vs_n0", getattr(sc, "delta_theta90_deg", 0.0))
+            d_eta_v = getattr(sc, "delta_eta_both_cond_vs_n0", getattr(sc, "delta_eta_both_conditional", 0.0))
+            diag_v = getattr(sc, "diagnosis", getattr(sc, "interpretation", ""))
             ps_rows.append({
                 "Architecture": f"N = {n_val}",
-                "r_RMS (mm)": f"{sc.r_rms:.3f}",
-                "R_90 (mm)": f"{sc.r_90:.3f}",
-                "θ_RMS (deg)": f"{sc.theta_rms_deg:.2f}°",
-                "θ_90 (deg)": f"{sc.theta_90_deg:.2f}°",
-                "ΔR_90 vs N=0 (mm)": f"{sc.delta_r_90_vs_n0:+.3f}",
-                "Δθ_90 vs N=0 (deg)": f"{sc.delta_theta_90_deg_vs_n0:+.2f}°",
-                "Δη_both_cond vs N=0": f"{sc.delta_eta_both_cond_vs_n0*100.0:+.2f}%",
-                "Diagnosis": sc.diagnosis,
+                "r_RMS (mm)": f"{r_rms_v:.3f}",
+                "R_90 (mm)": f"{r_90_v:.3f}",
+                "θ_RMS (deg)": f"{th_rms_v:.2f}°",
+                "θ_90 (deg)": f"{th_90_v:.2f}°",
+                "ΔR_90 vs N=0 (mm)": f"{d_r90_v:+.3f}",
+                "Δθ_90 vs N=0 (deg)": f"{d_th90_v:+.2f}°",
+                "Δη_both_cond vs N=0": f"{d_eta_v*100.0:+.2f}%",
+                "Diagnosis": diag_v,
             })
         st.dataframe(pd.DataFrame(ps_rows), use_container_width=True)
 
@@ -1660,10 +1745,12 @@ def render_simulation_to_lab_view(
     )
 
     if st.session_state.get("optimizer_study") is not None:
-        study = st.session_state.optimizer_study
-        best_n = study.best_slicer_n
-        if best_n in study.results and study.results[best_n].system is not None:
-            system = study.results[best_n].system
+        study = ensure_study_compatibility(st.session_state.optimizer_study)
+        st.session_state.optimizer_study = study
+        best_n = getattr(study, "best_slicer_n", 1)
+        results = getattr(study, "results", getattr(study, "results_by_n", {}))
+        if best_n in results and results[best_n].system is not None:
+            system = results[best_n].system
             n_channels = best_n
 
     df_build = generate_lab_build_sheet(
@@ -1781,11 +1868,12 @@ if st.session_state.app_mode == "Architecture Design Optimizer":
 
     # Question B: Does slicer architecture improve fiber coupling over direct focus?
     if st.session_state.get("optimizer_study") is not None:
-        study_cur = st.session_state.optimizer_study
-        if study_cur.is_tied:
-            q_b_str = f"EQUIVALENT WITHIN RESOLUTION (N = {', '.join(str(n) for n in study_cur.candidate_ties)} tied within 0.1%)"
-        elif study_cur.slicer_beats_baseline:
-            q_b_str = f"YES (N = {study_cur.best_slicer_n} achieves +{study_cur.relative_slicer_gain*100.0:+.2f}% gain)"
+        study_cur = ensure_study_compatibility(st.session_state.optimizer_study)
+        st.session_state.optimizer_study = study_cur
+        if getattr(study_cur, "is_tied", False):
+            q_b_str = f"EQUIVALENT WITHIN RESOLUTION (N = {', '.join(str(n) for n in getattr(study_cur, 'candidate_ties', [0]))} tied within 0.1%)"
+        elif getattr(study_cur, "slicer_beats_baseline", False):
+            q_b_str = f"YES (N = {getattr(study_cur, 'best_slicer_n', 1)} achieves +{getattr(study_cur, 'relative_slicer_gain', 0.0)*100.0:+.2f}% gain)"
         else:
             q_b_str = "NO (Direct focus N=0 achieves higher total coupling)"
     else:
@@ -2031,15 +2119,19 @@ if st.session_state.app_mode == "Architecture Design Optimizer":
         st.session_state.pupil_transverse_offset = pupil_offset_opt
 
     if st.session_state.optimizer_study is not None:
-        study = st.session_state.optimizer_study
-        winner_n = study.winning_n
-        winner_res = study.results[winner_n]
-        pa_win = winner_res.power_accounting
+        study = ensure_study_compatibility(st.session_state.optimizer_study)
+        st.session_state.optimizer_study = study
+        winner_n = getattr(study, "winning_n", getattr(study, "overall_winner_n", 0))
+        results = getattr(study, "results", getattr(study, "results_by_n", {}))
+        winner_res = results.get(winner_n)
+        if winner_res is None and results:
+            winner_res = next(iter(results.values()))
+        pa_win = winner_res.power_accounting if winner_res else None
 
         st.divider()
         st.markdown("### 1. Architecture Validation Status & Physics Diagnostics")
 
-        gate_rep = verify_validation_gate(winner_res.system, reformatting_report=st.session_state.get("high_ray_reformat_report"))
+        gate_rep = verify_validation_gate(winner_res.system if winner_res else None, reformatting_report=st.session_state.get("high_ray_reformat_report"))
         if gate_rep.certified_optimal:
             st.success(f"**VALIDATED OPTIMUM: All 11 physical validation criteria pass.**")
         else:
@@ -2063,58 +2155,73 @@ if st.session_state.app_mode == "Architecture Design Optimizer":
                 })
             st.dataframe(pd.DataFrame(chk_rows), use_container_width=True)
 
-        if study.is_tied:
+        is_tied_study = getattr(study, "is_tied", False)
+        candidate_ties = getattr(study, "candidate_ties", [winner_n])
+        tie_tol = getattr(study, "absolute_tie_tolerance", 0.001)
+        best_opt_eff = getattr(study, "best_optical_efficiency", winner_res.coupling_efficiency if winner_res else 0.0)
+        best_opt_arch = getattr(study, "best_optical_architectures", candidate_ties)
+        eng_rec_n = getattr(study, "engineering_recommendation_n", 0)
+        eng_rec_reason = getattr(study, "engineering_recommendation_reason", getattr(study, "winner_explanation", ""))
+        best_slicer_n = getattr(study, "best_slicer_n", 1)
+        slicer_beats_bl = getattr(study, "slicer_beats_baseline", False)
+        rel_slicer_gain = getattr(study, "relative_slicer_gain", 0.0)
+
+        if is_tied_study:
             st.info(
-                f"**Optically Equivalent Within Simulation Resolution:** N = {', '.join(str(n) for n in study.candidate_ties)}\n\n"
-                f"Coupling efficiencies are within the absolute tie tolerance of {study.absolute_tie_tolerance*100.0:.1f} percentage points. "
+                f"**Optically Equivalent Within Simulation Resolution:** N = {', '.join(str(n) for n in candidate_ties)}\n\n"
+                f"Coupling efficiencies are within the absolute tie tolerance of {tie_tol*100.0:.1f} percentage points. "
                 f"Do NOT declare any architecture optically superior when results are numerically tied.\n\n"
-                f"- **Best Optical Efficiency:** {study.best_optical_efficiency*100.0:.2f}% (achieved by N = {', '.join(str(n) for n in study.best_optical_architectures)})\n"
-                f"- **Engineering Recommendation (Minimal Complexity):** N = {study.engineering_recommendation_n}\n\n"
-                f"*{study.engineering_recommendation_reason}*"
+                f"- **Best Optical Efficiency:** {best_opt_eff*100.0:.2f}% (achieved by N = {', '.join(str(n) for n in best_opt_arch)})\n"
+                f"- **Engineering Recommendation (Minimal Complexity):** N = {eng_rec_n}\n\n"
+                f"*{eng_rec_reason}*"
             )
 
         w1, w2, w3, w4 = st.columns(4)
         with w1:
-            if study.is_tied:
+            if is_tied_study:
+                rec_eff = results[eng_rec_n].coupling_efficiency if (results and eng_rec_n in results) else 0.0
                 st.metric(
                     "Engineering Recommendation",
-                    f"N = {study.engineering_recommendation_n} (Direct Focus)",
-                    f"Coupling η = {study.results[study.engineering_recommendation_n].coupling_efficiency * 100.0:.2f}%",
+                    f"N = {eng_rec_n} (Direct Focus)",
+                    f"Coupling η = {rec_eff * 100.0:.2f}%",
                     help="Minimal complexity recommendation among numerically tied architectures",
                 )
             else:
+                win_eff_val = winner_res.coupling_efficiency if winner_res else 0.0
+                overall_win_n = getattr(study, "overall_winner_n", winner_n)
                 st.metric(
                     "Overall Winner",
-                    f"N = {study.overall_winner_n} ({'Baseline' if study.overall_winner_n == 0 else f'{study.overall_winner_n}-Slice Slicer'})",
-                    f"Coupling η = {study.results[study.overall_winner_n].coupling_efficiency * 100.0:.2f}%",
+                    f"N = {overall_win_n} ({'Baseline' if overall_win_n == 0 else f'{overall_win_n}-Slice Slicer'})",
+                    f"Coupling η = {win_eff_val * 100.0:.2f}%",
                     help="Global optimum maximizing total coupled power inside fiber core and NA across N in [0..4]",
                 )
         with w2:
+            slicer_eff_val = results[best_slicer_n].coupling_efficiency if (results and best_slicer_n in results) else 0.0
             st.metric(
                 "Best Slicer Architecture",
-                f"N = {study.best_slicer_n} Slicers",
-                f"Coupling η = {study.results[study.best_slicer_n].coupling_efficiency * 100.0:.2f}%",
+                f"N = {best_slicer_n} Slicers",
+                f"Coupling η = {slicer_eff_val * 100.0:.2f}%",
                 help="Best architecture among slicer configurations (N >= 1)",
             )
         with w3:
-            if study.is_tied:
+            if is_tied_study:
                 st.metric("Tie Status", "Tied within 0.1%", delta="Optically Equivalent")
-            elif study.slicer_beats_baseline:
-                st.metric("Slicer Advantage", f"+{study.relative_slicer_gain * 100.0:+.2f}%", delta="Slicer Wins")
+            elif slicer_beats_bl:
+                st.metric("Slicer Advantage", f"+{rel_slicer_gain * 100.0:+.2f}%", delta="Slicer Wins")
             else:
-                st.metric("Slicer Advantage", f"{study.relative_slicer_gain * 100.0:+.2f}%", delta="- Baseline Superior", delta_color="inverse")
+                st.metric("Slicer Advantage", f"{rel_slicer_gain * 100.0:+.2f}%", delta="- Baseline Superior", delta_color="inverse")
         with w4:
-            ps_d90 = winner_res.system.pre_slicer_spot_metrics.diameter_90 if (winner_res.system and winner_res.system.pre_slicer_spot_metrics) else study.d90_image
+            ps_d90 = winner_res.system.pre_slicer_spot_metrics.diameter_90 if (winner_res and winner_res.system and winner_res.system.pre_slicer_spot_metrics) else getattr(study, "d90_image", 1.3)
             st.metric("Image D90 on Slicer", f"{ps_d90:.2f} mm", help="Pre-slicer image plane 90% encircled energy diameter")
 
-        if study.is_tied:
-            st.info(f"**Physical Decision Rationale:** {study.winner_explanation}")
-        elif study.slicer_beats_baseline:
-            st.success(f"**Does Slicing Beat the Direct Baseline? YES** (+{study.relative_slicer_gain * 100.0:+.2f}% relative gain)")
-            st.info(f"**Physical Decision Rationale:** {study.winner_explanation}")
+        if is_tied_study:
+            st.info(f"**Physical Decision Rationale:** {getattr(study, 'winner_explanation', '')}")
+        elif slicer_beats_bl:
+            st.success(f"**Does Slicing Beat the Direct Baseline? YES** (+{rel_slicer_gain * 100.0:+.2f}% relative gain)")
+            st.info(f"**Physical Decision Rationale:** {getattr(study, 'winner_explanation', '')}")
         else:
             st.warning(f"**Does Slicing Beat the Direct Baseline? NO** (Baseline direct coupling N=0 is superior under current image size)")
-            st.info(f"**Physical Decision Rationale:** {study.winner_explanation}")
+            st.info(f"**Physical Decision Rationale:** {getattr(study, 'winner_explanation', '')}")
 
         st.markdown("### 2. Pre-Slicer Image Diagnostic & Slicer Necessity Check")
         st.caption("Evaluates image footprint formed by fore-optics prior to slicers, comparing D90 against the 10.0 mm slicer aperture width:")

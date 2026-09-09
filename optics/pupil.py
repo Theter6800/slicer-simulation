@@ -64,6 +64,14 @@ class PupilMirror(Surface3D):
         self._sync_angles_from_normal()
 
     @property
+    def mirror_id(self) -> int:
+        return self.channel_id
+
+    @property
+    def diameter(self) -> float:
+        return self.width
+
+    @property
     def center_x(self) -> float:
         return float(self.center[0])
 

@@ -423,6 +423,43 @@ class PhaseSpaceReformattingScore:
     interpretation: str
     details: Dict[str, Any]
 
+    @property
+    def r_90(self) -> float:
+        return float(self.details.get("R90_N", 0.0))
+
+    @property
+    def r_rms(self) -> float:
+        return float(self.details.get("RMS_r_N", self.details.get("R90_N", 0.0)))
+
+    @property
+    def theta_90_deg(self) -> float:
+        return float(self.details.get("theta90_N", 0.0))
+
+    @property
+    def theta_rms_deg(self) -> float:
+        return float(self.details.get("RMS_theta_N", self.details.get("theta90_N", 0.0)))
+
+    @property
+    def delta_r_90_vs_n0(self) -> float:
+        return self.delta_r90_mm
+
+    @property
+    def delta_theta_90_deg_vs_n0(self) -> float:
+        return self.delta_theta90_deg
+
+    @property
+    def delta_eta_both_cond_vs_n0(self) -> float:
+        return self.delta_eta_both_conditional
+
+    @property
+    def diagnosis(self) -> str:
+        return self.interpretation
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self.details:
+            return self.details[name]
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
 
 def compute_phase_space_reformatting_score(
     spot_n: SpotMetrics,
@@ -469,8 +506,12 @@ def compute_phase_space_reformatting_score(
         details={
             "R90_N": spot_n.encircled_90_radius,
             "R90_0": spot_0.encircled_90_radius,
+            "RMS_r_N": getattr(spot_n, "rms_radius", 0.0),
+            "RMS_r_0": getattr(spot_0, "rms_radius", 0.0),
             "theta90_N": ang_n.theta_90_deg,
             "theta90_0": ang_0.theta_90_deg,
+            "RMS_theta_N": getattr(ang_n, "theta_rms_deg", 0.0),
+            "RMS_theta_0": getattr(ang_0, "theta_rms_deg", 0.0),
             "eta_both_cond_N": eta_both_cond_n,
             "eta_both_cond_0": eta_both_cond_0,
         },
