@@ -300,6 +300,21 @@ def ensure_study_compatibility(study: Any) -> Any:
             eta_0 = effs.get(0, 0.0)
             eta_s = effs.get(best_s_n, 0.0)
             setattr(study, "relative_slicer_gain", (eta_s - eta_0) / eta_0 if eta_0 > 1e-9 else 0.0)
+        if not hasattr(study, "config") or getattr(study, "config", None) is None:
+            cur_f_fore_val = float(st.session_state.get("fore_focal_opt") or 150.0)
+            cur_f_cond_val = float(st.session_state.get("condenser_focal_length") or 22.0)
+            cur_seed_raw = st.session_state.get("opt_seed") or st.session_state.get("random_seed")
+            cur_seed_val = int(cur_seed_raw) if cur_seed_raw is not None else 42
+            setattr(study, "config", OptimizationConfig(
+                source_mode=str(st.session_state.get("source_mode") or "SUN"),
+                fore_focal_length=cur_f_fore_val,
+                condenser_focal_length=cur_f_cond_val,
+                pupil_layout_side=str(st.session_state.get("pupil_layout_side") or "lower"),
+                pupil_distance_z=float(st.session_state.get("pupil_dist") or 40.0),
+                pupil_transverse_offset=float(st.session_state.get("pupil_transverse_offset") or 20.0),
+                random_seed=cur_seed_val,
+                wrong_pupil_policy=st.session_state.get("wrong_pupil_policy", "reject_as_stray"),
+            ))
     except Exception:
         pass
     return study
@@ -1156,7 +1171,7 @@ def render_phase_space_and_neff_sweep_figure(sweep_res: MagnificationSweepResult
     return fig
 
 
-def render_20_item_optimization_breakdown(res: SingleNOptimizationResult, config: OptimizationConfig, d90: float):
+def render_20_item_optimization_breakdown(res: SingleNOptimizationResult, config: Optional[OptimizationConfig] = None, d90: float = 1.3):
     """
     Renders the complete 20-item final optimization output breakdown (Directive 19):
     1. Architecture: N_configured, N_effective
@@ -1168,6 +1183,7 @@ def render_20_item_optimization_breakdown(res: SingleNOptimizationResult, config
     7. Losses: slicer gaps, wrong pupil, missed pupil, condenser clipping, fiber spatial rejection, fiber angular rejection
     8. Final: eta_geometric, eta_physical
     """
+    cfg = config if config is not None else OptimizationConfig()
     pa = res.power_accounting
     col_a, col_b, col_c = st.columns(3)
     with col_a:
@@ -1177,8 +1193,8 @@ def render_20_item_optimization_breakdown(res: SingleNOptimizationResult, config
         st.markdown(f"- **Intermediate Image D90**: `{d90:.2f} mm`")
 
         st.markdown("##### 2. Final Injection Optic (Condenser)")
-        st.markdown(f"- **Focal Length**: `{config.condenser_focal_length:.1f} mm`")
-        z_cond = config.z_slicer + config.pupil_distance_z + config.condenser_distance_z if res.n_channels > 0 else (config.z_slicer + 40.0)
+        st.markdown(f"- **Focal Length**: `{cfg.condenser_focal_length:.1f} mm`")
+        z_cond = cfg.z_slicer + cfg.pupil_distance_z + cfg.condenser_distance_z if res.n_channels > 0 else (cfg.z_slicer + 40.0)
         st.markdown(f"- **Axial Position (z)**: `{z_cond:.1f} mm`")
         p_cond_frac = (pa.p_on_condenser / max(1e-9, pa.p_launch) * 100.0) if pa else 0.0
         st.markdown(f"- **Clear-Aperture Utilization**: `{p_cond_frac:.1f}%`")
@@ -2240,6 +2256,7 @@ if st.session_state.app_mode == "Architecture Design Optimizer":
             status_box.markdown(f"**Optimization in Progress (N = {curr_n})**: {msg}")
 
         study_res = optimizer.run_multi_n_study(n_min, n_max, progress_callback=prog_callback)
+        study_res.config = cfg
         prog_bar.progress(1.0)
         status_box.success(f"Architecture study complete! Winning configuration: N* = {study_res.winning_n} channels.")
         st.session_state.optimizer_study = study_res
@@ -2254,12 +2271,28 @@ if st.session_state.app_mode == "Architecture Design Optimizer":
     if st.session_state.optimizer_study is not None:
         study = ensure_study_compatibility(st.session_state.optimizer_study)
         st.session_state.optimizer_study = study
+        opt_config = getattr(study, "config", None)
+        if opt_config is None:
+            opt_config = OptimizationConfig(
+                source_mode=str(st.session_state.get("source_mode") or "SUN"),
+                fore_focal_length=float(st.session_state.get("fore_focal_opt") or 150.0),
+                condenser_focal_length=float(st.session_state.get("condenser_focal_length") or 22.0),
+                pupil_layout_side=str(st.session_state.get("pupil_layout_side") or "lower"),
+                pupil_distance_z=float(st.session_state.get("pupil_dist") or 40.0),
+                pupil_transverse_offset=float(st.session_state.get("pupil_transverse_offset") or 20.0),
+                random_seed=int(st.session_state.get("opt_seed") or st.session_state.get("random_seed") or 42),
+                wrong_pupil_policy=st.session_state.get("wrong_pupil_policy", "reject_as_stray"),
+            )
+            setattr(study, "config", opt_config)
         winner_n = getattr(study, "winning_n", getattr(study, "overall_winner_n", 0))
         results = getattr(study, "results", getattr(study, "results_by_n", {}))
         winner_res = results.get(winner_n)
         if winner_res is None and results:
             winner_res = next(iter(results.values()))
         pa_win = winner_res.power_accounting if winner_res else None
+        ps_d90 = getattr(study, "d90_image", 1.3)
+        if winner_res and winner_res.system and winner_res.system.pre_slicer_spot_metrics:
+            ps_d90 = winner_res.system.pre_slicer_spot_metrics.diameter_90
 
         st.divider()
         st.markdown("### 1. Architecture Validation Status & Physics Diagnostics")
@@ -2597,7 +2630,7 @@ if st.session_state.app_mode == "Architecture Design Optimizer":
                     pupil_offset_values=[20.0],
                     condenser_focal_values=[22.0, 30.0],
                     rays=400,
-                    seed=int(opt_seed),
+                    seed=int(opt_seed if "opt_seed" in locals() else (st.session_state.get("opt_seed") or st.session_state.get("random_seed") or 42)),
                 )
                 st.session_state.hierarchical_search_result = h_res
 

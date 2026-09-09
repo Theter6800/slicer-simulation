@@ -602,6 +602,7 @@ class MultiNStudyResult:
     engineering_recommendation_n: int = 0
     engineering_recommendation_reason: str = ""
     phase_space_scores: Dict[int, PhaseSpaceReformattingScore] = field(default_factory=dict)
+    config: Optional[OptimizationConfig] = None
 
     @property
     def winning_n(self) -> int:
@@ -618,6 +619,8 @@ class MultiNStudyResult:
     def __getattr__(self, name: str) -> Any:
         if name == "is_tied":
             return False
+        if name == "config":
+            return None
         if name == "candidate_ties":
             return [self.overall_winner_n] if hasattr(self, "overall_winner_n") else [0]
         if name == "best_optical_efficiency":
@@ -1625,6 +1628,7 @@ class SlicerPupilOptimizer:
             engineering_recommendation_n=eng_rec_n,
             engineering_recommendation_reason=eng_reason,
             phase_space_scores=phase_space_scores,
+            config=self.config,
         )
 
 

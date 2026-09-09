@@ -278,3 +278,19 @@ def test_session_state_none_resilience():
     assert cur_f_cond_val == 22.0
     assert cur_n_val == 2
     assert cur_seed_val == 42
+
+
+def test_multin_study_result_has_config_and_export_handles_none_config():
+    """Verifies that MultiNStudyResult preserves config and export functions handle config=None."""
+    cfg = OptimizationConfig(source_mode="SUN", random_seed=42, exploration_rays=100, validation_rays=150)
+    optimizer = SlicerPupilOptimizer(cfg)
+    study = optimizer.run_multi_n_study(n_min=0, n_max=1)
+    assert hasattr(study, "config")
+    assert study.config is not None
+    assert study.config.random_seed == 42
+
+    winner_res = study.results[study.winning_n]
+    json_str = export_architecture_design_to_json(winner_res, config=None)
+    assert len(json_str) > 0
+    csv_str = export_architecture_design_to_csv(winner_res, config=None)
+    assert len(csv_str) > 0
