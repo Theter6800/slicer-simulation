@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Any, Optional, Callable
 import time
+import json
 import numpy as np
 import pandas as pd
 from scipy.optimize import differential_evolution, minimize
@@ -127,6 +128,25 @@ class AlignmentToleranceReport:
     summary_text: str
 
 
+@dataclass
+class OptimizationVariablesSummary:
+    """Classifies all simulator parameters into the 4 mandatory categories."""
+    optimized_inner: List[Dict[str, Any]]
+    derived_alignment: List[Dict[str, Any]]
+    fixed_constraints: List[Dict[str, Any]]
+    study_parameters: List[Dict[str, Any]]
+    outer_sweep_variables: Optional[List[Dict[str, Any]]] = None
+
+
+@dataclass
+class HierarchicalSearchResult:
+    """Outcome of 2-level hierarchical search (outer architecture grid + inner DE)."""
+    best_outer_parameters: Dict[str, Any]
+    best_inner_result: SingleNOptimizationResult
+    all_evaluated_architectures: pd.DataFrame
+    summary_text: str
+
+
 
 def compute_analytical_optical_checks(
     fiber_core_diameter: float = 1.0,
@@ -240,6 +260,192 @@ def compute_slicer_necessity_diagnostic(
     })
 
 
+def compute_detailed_loss_breakdown(pa: Optional[PowerAccounting], n_channels: int = 1) -> Dict[str, float]:
+    """Computes detailed optical loss breakdown as fractions of launched power."""
+    if pa is None or pa.p_launch <= 0:
+        return {
+            "slicer_inter_slice_gap_loss": 0.0,
+            "slicer_field_overfill_loss": 0.0,
+            "pupil_array_gap_loss": 0.0,
+            "wrong_pupil_rejection_loss": 0.0,
+            "condenser_clipping_loss": 0.0,
+            "fiber_spatial_clipping_loss": 0.0,
+            "fiber_angular_clipping_loss": 0.0,
+            "coating_absorption_loss": 0.0,
+        }
+    p_l = max(1e-9, pa.p_launch)
+    p_fib = pa.p_at_fiber_plane
+    gap_loss = float(getattr(pa, "p_lost_at_slicer_gaps", 0.0) / p_l)
+    overfill_loss = float(getattr(pa, "p_missed_slicer_array", 0.0) / p_l)
+    wrong_pupil_loss = float(getattr(pa, "p_on_wrong_pupil", 0.0) / p_l)
+    missed_pupil_loss = float(getattr(pa, "p_missed_all_pupils", 0.0) / p_l)
+    missed_cond_loss = float(getattr(pa, "p_missed_condenser", 0.0) / p_l)
+    p_miss_core = max(0.0, p_fib * (1.0 - pa.eta_core_conditional))
+    p_core_excess_na = max(0.0, (p_fib * pa.eta_core_conditional) - pa.p_inside_core_and_na)
+
+    p_opt_ideal = pa.p_inside_core_and_na
+    coating_loss = float(p_opt_ideal * (1.0 - 0.98 * 0.98 * 0.96) / p_l) if n_channels > 0 else float(p_opt_ideal * (1.0 - 0.96) / p_l)
+
+    return {
+        "slicer_inter_slice_gap_loss": gap_loss,
+        "slicer_field_overfill_loss": overfill_loss,
+        "pupil_array_gap_loss": missed_pupil_loss,
+        "wrong_pupil_rejection_loss": wrong_pupil_loss,
+        "condenser_clipping_loss": missed_cond_loss,
+        "fiber_spatial_clipping_loss": float(p_miss_core / p_l),
+        "fiber_angular_clipping_loss": float(p_core_excess_na / p_l),
+        "coating_absorption_loss": coating_loss,
+    }
+
+
+def get_optimization_variables_summary(
+    config: Optional[OptimizationConfig] = None,
+    n: int = 1,
+    include_outer_sweep: bool = False,
+) -> OptimizationVariablesSummary:
+    """
+    Returns explicit classification of all simulation parameters into 4 mandatory categories:
+    1. Optimized Variables (Inner geometry x_s, y_s, x_p, y_p, z_p and discrete N)
+    2. Derived Alignment Values (Mirror tilts and image plane Z analytically determined)
+    3. Fixed Hardware Constraints (Fiber core, NA, permanently locked 10x10 mm slicer)
+    4. Current Study Parameters (Source mode, ray count, random seed, coatings, condenser aperture)
+    """
+    cfg = config if config is not None else OptimizationConfig()
+
+    # 1. OPTIMIZED VARIABLES
+    opt_inner = [
+        {
+            "Variable": f"Slicer Positions (x_s[i], y_s[i]) for i in [1..{n}]",
+            "Type": "Continuous (2D Image Plane)",
+            "Bounds": "+/- 1.0 mm from nominal slice center",
+            "Target Plane": f"Image Plane z = {cfg.z_slicer:.1f} mm (Locked)",
+            "Role": "Align slice apertures to maximize intercepted beam power",
+        },
+        {
+            "Variable": f"Pupil Mirror Positions (x_p[i], y_p[i], z_p[i]) for i in [1..{n}]",
+            "Type": "Continuous (3D Space)",
+            "Bounds": f"x in [-30, 30] mm, y on {cfg.pupil_layout_side} side (~{cfg.pupil_transverse_offset:.0f} mm), z in [{cfg.z_slicer+20:.0f}, {cfg.z_slicer+80:.0f}] mm",
+            "Target Plane": "Free 3D position in non-vignetting region",
+            "Role": "Re-image sub-pupils onto condenser lens without overlap",
+        },
+        {
+            "Variable": "Discrete Slice Count (N)",
+            "Type": "Discrete Integer",
+            "Bounds": f"N in [{cfg.n_min} ... {cfg.n_max}] plus direct baseline N=0",
+            "Target Plane": "Architectural Topology",
+            "Role": "Select number of spatial slices for phase-space reformatting",
+        },
+    ]
+
+    outer_sweep = None
+    if include_outer_sweep:
+        outer_sweep = [
+            {"Parameter": "Slice Count (N)", "Type": "Discrete", "Range": "[0, 1, 2, 3, 4]"},
+            {"Parameter": "Intermediate Image D90", "Type": "Continuous", "Range": "[1.3 ... 40.0] mm (via focal length)"},
+            {"Parameter": "Pupil Axial Distance (L_pupil)", "Type": "Continuous", "Range": "[30.0 ... 80.0] mm"},
+            {"Parameter": "Pupil Transverse Offset", "Type": "Continuous", "Range": "[10.0 ... 40.0] mm"},
+            {"Parameter": "Condenser Focal Length (f_cond)", "Type": "Continuous", "Range": "[15.0 ... 35.0] mm"},
+        ]
+
+    # 2. DERIVED VARIABLES (Explicitly labeled 'Derived alignment values', NEVER 'Optimized values')
+    derived = [
+        {
+            "Variable": f"Slicer Mirror Tip & Tilt (theta_x_s[i], theta_y_s[i]) for i in [1..{n}]",
+            "Classification": "Derived alignment values (Analytical)",
+            "Derivation Method": "Calculated analytically via 3D reflection bisector aiming fore-optics chief ray to pupil mirror center",
+            "Status": "Derived automatically; NOT an optimization variable",
+        },
+        {
+            "Variable": f"Pupil Mirror Tip & Tilt (theta_x_p[i], theta_y_p[i]) for i in [1..{n}]",
+            "Classification": "Derived alignment values (Analytical)",
+            "Derivation Method": "Calculated analytically to direct reflected chief ray toward the condenser lens vertex",
+            "Status": "Derived automatically; NOT an optimization variable",
+        },
+        {
+            "Variable": "Intermediate Image Plane Axial Position (z_slicer)",
+            "Classification": "Derived alignment values (Geometry)",
+            "Derivation Method": f"Locked strictly to fore-optics image plane: z_slicer = z_fore ({cfg.z_fore:.1f} mm) + f_eff ({cfg.fore_focal_length:.1f} mm) = {cfg.z_slicer:.1f} mm",
+            "Status": "Locked by optical law; NOT an optimization variable",
+        },
+    ]
+
+    # 3. FIXED HARDWARE CONSTRAINTS
+    fixed = [
+        {
+            "Constraint": "Fiber Core Diameter",
+            "Value": f"{cfg.fiber_core_diameter:.1f} mm (Radius = {cfg.fiber_core_diameter/2.0:.2f} mm)",
+            "Physical Meaning": "Hard circular core boundary; rays with r > 0.5 mm cannot guide",
+        },
+        {
+            "Constraint": "Fiber Numerical Aperture (NA)",
+            "Value": f"{cfg.fiber_na:.2f} (Acceptance half-angle ~ {np.degrees(np.arcsin(cfg.fiber_na)):.2f} deg)",
+            "Physical Meaning": "Hard angular limit; rays with n_ext * sin(theta) > 0.22 are lost as cladding modes",
+        },
+        {
+            "Constraint": "Fiber Coupled Ray Condition",
+            "Value": "sqrt(x^2 + y^2) <= 0.5 mm AND n_ext * sin(theta) <= 0.22",
+            "Physical Meaning": "BOTH spatial and angular conditions must be satisfied simultaneously",
+        },
+        {
+            "Constraint": "Slicer Total Aperture Dimensions",
+            "Value": f"{cfg.slicer_physical_size:.1f} mm x {cfg.slicer_physical_size:.1f} mm (Permanently Locked)",
+            "Physical Meaning": "Measured physical hardware aperture; NEVER modified by the optimizer",
+        },
+        {
+            "Constraint": "Pupil Mirror Count Equality",
+            "Value": f"N_pupil == N_slicer == {n}",
+            "Physical Meaning": "Each slice mirror is paired one-to-one with exactly one dedicated pupil mirror",
+        },
+        {
+            "Constraint": "Pupil Array Topology",
+            "Value": f"One-sided layout ({cfg.pupil_layout_side} side)",
+            "Physical Meaning": "Prevents mechanical collisions with fore-optics entrance beam clearance",
+        },
+    ]
+
+    # 4. CURRENT STUDY PARAMETERS
+    study = [
+        {
+            "Parameter": "Source Mode",
+            "Setting": cfg.source_mode,
+            "Description": "Sun disk source (0.266 deg angular radius) or LED source profile",
+        },
+        {
+            "Parameter": "Ray Budget",
+            "Setting": f"Exploration: {cfg.exploration_rays:,} rays | Validation: {cfg.validation_rays:,} rays",
+            "Description": "Exploration used during optimizer iterations; validation used for final physical trace",
+        },
+        {
+            "Parameter": "Random Seed",
+            "Setting": str(cfg.random_seed),
+            "Description": "Ensures identical cloned ray bundle across all architecture comparisons",
+        },
+        {
+            "Parameter": "Optical Surface Coatings",
+            "Setting": "R_slicer = 0.98, R_pupil = 0.98, T_lens = 0.96",
+            "Description": "Realistic dielectric & metallic coatings applied to physical efficiency estimate",
+        },
+        {
+            "Parameter": "Condenser Clear Aperture",
+            "Setting": f"{cfg.condenser_diameter:.1f} mm diameter",
+            "Description": "Physical clear aperture of the final injection optic",
+        },
+        {
+            "Parameter": "Fore-Optics Mode",
+            "Setting": "Hardware Locked f=150.0 mm" if cfg.fore_focal_length == 150.0 else f"Theoretical f_eff = {cfg.fore_focal_length:.1f} mm",
+            "Description": "Determines pre-slicer intermediate image size D90",
+        },
+    ]
+
+    return OptimizationVariablesSummary(
+        optimized_inner=opt_inner,
+        derived_alignment=derived,
+        fixed_constraints=fixed,
+        study_parameters=study,
+        outer_sweep_variables=outer_sweep,
+    )
+
+
 @dataclass
 class OptimizationConfig:
     """Configuration parameters for the architectural design optimizer."""
@@ -344,6 +550,8 @@ class SingleNOptimizationResult:
     spot_metrics_fiber: Optional[SpotMetrics] = None
     angular_metrics_fiber: Optional[AngularMetrics] = None
     phase_space_score: Optional[PhaseSpaceReformattingScore] = None
+    variable_bounds: Dict[str, Tuple[float, float]] = field(default_factory=dict)
+    detailed_loss_breakdown: Dict[str, float] = field(default_factory=dict)
 
     @property
     def clipping_loss_fraction(self) -> float:
@@ -362,6 +570,10 @@ class SingleNOptimizationResult:
             return "NO MATERIAL IMPROVEMENT"
         if name in ("spot_metrics_fiber", "angular_metrics_fiber", "phase_space_score"):
             return None
+        if name == "variable_bounds":
+            return {}
+        if name == "detailed_loss_breakdown":
+            return {}
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
 
@@ -930,6 +1142,31 @@ class SlicerPupilOptimizer:
         eta_ideal = max(eta_ideal, eta)
         penalty = float(max(0.0, eta_ideal - eta))
 
+        # Explicit bounds dictionary for all inner optimized variables
+        bounds_dict: Dict[str, Tuple[float, float]] = {}
+        for i in range(n):
+            bounds_dict[f"slicer_{i+1}_x"] = bounds[2 * i]
+            bounds_dict[f"slicer_{i+1}_y"] = bounds[2 * i + 1]
+        p_offset_idx = 2 * n
+        for i in range(n):
+            bounds_dict[f"pupil_{i+1}_x"] = bounds[p_offset_idx + 3 * i]
+            bounds_dict[f"pupil_{i+1}_y"] = bounds[p_offset_idx + 3 * i + 1]
+            bounds_dict[f"pupil_{i+1}_z"] = bounds[p_offset_idx + 3 * i + 2]
+
+        # Multi-start statistics (10 random restarts)
+        ms_res = validate_multi_start_optimization(
+            n_channels=n,
+            n_restarts=10,
+            rays=min(300, self.config.exploration_rays),
+        )
+        ms_stats = dict(ms_res.details)
+        best_e = ms_stats.get("best_coupling_efficiency", eta)
+        eff_list = ms_stats.get("all_efficiencies", [eta])
+        ms_stats["n_converged"] = int(np.sum(np.array(eff_list) >= (best_e - 0.005)))
+        ms_stats["std_coupling"] = ms_stats.get("std_coupling_efficiency", 0.0)
+
+        detailed_losses = compute_detailed_loss_breakdown(pa, n_channels=n)
+
         return SingleNOptimizationResult(
             n_channels=n,
             success=bool(de_res.success or True),
@@ -962,6 +1199,9 @@ class SlicerPupilOptimizer:
             dominant_limitation=dom_lim,
             spot_metrics_fiber=spot_fib,
             angular_metrics_fiber=ang_fib,
+            variable_bounds=bounds_dict,
+            detailed_loss_breakdown=detailed_losses,
+            multi_start_stats=ms_stats,
         )
 
     def evaluate_ideal_system(
@@ -1093,10 +1333,16 @@ class SlicerPupilOptimizer:
             "median_coupling_efficiency": float(base_pa.eta_total),
             "worst_coupling_efficiency": float(base_pa.eta_total),
             "std_coupling": 0.0,
+            "std_coupling_efficiency": 0.0,
             "best_clipping": float(1.0 - throughput),
             "median_clipping": float(1.0 - throughput),
             "worst_clipping": float(1.0 - throughput),
+            "n_converged": 10,
+            "all_efficiencies": [float(base_pa.eta_total)] * 10,
         }
+
+        b_bounds: Dict[str, Tuple[float, float]] = {"N": (0.0, 0.0)}
+        detailed_losses_0 = compute_detailed_loss_breakdown(base_pa, n_channels=0)
 
         return SingleNOptimizationResult(
             n_channels=0,
@@ -1131,6 +1377,8 @@ class SlicerPupilOptimizer:
             dominant_limitation=dom_lim,
             spot_metrics_fiber=spot_fib,
             angular_metrics_fiber=ang_fib,
+            variable_bounds=b_bounds,
+            detailed_loss_breakdown=detailed_losses_0,
         )
 
     def run_multi_n_study(
@@ -1189,6 +1437,7 @@ class SlicerPupilOptimizer:
             "Best Coupling (eta_total)": f"{res0.coupling_efficiency*100.0:.2f}%",
             "Median Coupling (eta_total)": f"{res0.coupling_efficiency*100.0:.2f}%",
             "Worst Coupling (eta_total)": f"{res0.coupling_efficiency*100.0:.2f}%",
+            "Converged": "10 / 10",
             "Best Clipping": f"{res0.clipping_loss*100.0:.1f}%",
             "Median Clipping": f"{res0.clipping_loss*100.0:.1f}%",
             "Worst Clipping": f"{res0.clipping_loss*100.0:.1f}%",
@@ -1253,18 +1502,17 @@ class SlicerPupilOptimizer:
                 "Compute Time": f"{res.execution_time_sec:.1f} s",
             })
 
-            # Run multi-start statistics (10 random restarts) for candidate N
-            ms_res = validate_multi_start_optimization(n_channels=n, n_restarts=10, rays=min(300, self.config.exploration_rays))
-            res.multi_start_stats = ms_res.details
+            ms_details = res.multi_start_stats or {}
             multi_start_rows.append({
                 "N Slicers": n,
-                "Restarts": ms_res.details["n_restarts"],
-                "Best Coupling (eta_total)": f"{ms_res.details['best_coupling_efficiency']*100.0:.2f}%",
-                "Median Coupling (eta_total)": f"{ms_res.details['median_coupling_efficiency']*100.0:.2f}%",
-                "Worst Coupling (eta_total)": f"{ms_res.details['worst_coupling_efficiency']*100.0:.2f}%",
-                "Best Clipping": f"{ms_res.details['best_clipping']*100.0:.1f}%",
-                "Median Clipping": f"{ms_res.details['median_clipping']*100.0:.1f}%",
-                "Worst Clipping": f"{ms_res.details['worst_clipping']*100.0:.1f}%",
+                "Restarts": ms_details.get("n_restarts", 10),
+                "Best Coupling (eta_total)": f"{ms_details.get('best_coupling_efficiency', res.coupling_efficiency)*100.0:.2f}%",
+                "Median Coupling (eta_total)": f"{ms_details.get('median_coupling_efficiency', res.coupling_efficiency)*100.0:.2f}%",
+                "Worst Coupling (eta_total)": f"{ms_details.get('worst_coupling_efficiency', res.coupling_efficiency)*100.0:.2f}%",
+                "Converged": f"{ms_details.get('n_converged', 10)} / 10",
+                "Best Clipping": f"{ms_details.get('best_clipping', res.clipping_loss)*100.0:.1f}%",
+                "Median Clipping": f"{ms_details.get('median_clipping', res.clipping_loss)*100.0:.1f}%",
+                "Worst Clipping": f"{ms_details.get('worst_clipping', res.clipping_loss)*100.0:.1f}%",
             })
 
         comp_df = pd.DataFrame(comparison_rows)
@@ -1383,9 +1631,11 @@ class SlicerPupilOptimizer:
 def run_magnification_slice_sweep(
     d90_values: Optional[List[float]] = None,
     n_values: Optional[List[int]] = None,
+    condenser_focal_length: float = 22.0,
     n_rays: int = 500,
     seed: int = 42,
     progress_callback: Optional[Callable[[float, str], None]] = None,
+    **kwargs,
 ) -> MagnificationSweepResult:
     """
     Executes a 2D design sweep across image diameter D90 in [1.3 ... 40.0 mm] and N in [0 ... 4].
@@ -1428,6 +1678,8 @@ def run_magnification_slice_sweep(
                     fore_focal_length=f_eff,
                     z_fore=z_fore,
                     z_slicer=z_img,
+                    condenser_focal_length=condenser_focal_length,
+                    fiber_distance=condenser_focal_length,
                     validation_rays=n_rays,
                     random_seed=seed,
                 )
@@ -1446,6 +1698,8 @@ def run_magnification_slice_sweep(
                     fore_focal_length=f_eff,
                     z_fore=z_fore,
                     z_slicer=z_img,
+                    condenser_focal_length=condenser_focal_length,
+                    fiber_distance=condenser_focal_length,
                     validation_rays=n_rays,
                     random_seed=seed,
                     min_slicer_gap=gap,
@@ -1543,6 +1797,317 @@ def run_magnification_slice_sweep(
         crossover_d90=crossover,
         summary_text=summary,
     )
+
+
+def run_hierarchical_architecture_search(
+    base_config: Optional[OptimizationConfig] = None,
+    n_values: Optional[List[int]] = None,
+    d90_values: Optional[List[float]] = None,
+    pupil_distance_values: Optional[List[float]] = None,
+    pupil_offset_values: Optional[List[float]] = None,
+    condenser_focal_values: Optional[List[float]] = None,
+    rays: int = 400,
+    seed: int = 42,
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+) -> HierarchicalSearchResult:
+    """
+    Executes a 2-level hierarchical search:
+    Level 1: Outer architecture sweep over (N, D90, L_pupil, offset_pupil, f_condenser)
+    Level 2: Inner geometry Differential Evolution optimizing slicer and pupil positions.
+    Evaluates N=0 direct focus baseline and all candidate slicer combinations.
+    Maximizes strictly physically valid fiber coupling eta_total = P_core_AND_NA / P_launch.
+    """
+    cfg = base_config if base_config is not None else OptimizationConfig()
+
+    if n_values is None:
+        n_values = [0, 1, 2, 3, 4]
+    if d90_values is None:
+        d90_values = [1.3, 10.0, 20.0]
+    if pupil_distance_values is None:
+        pupil_distance_values = [40.0]
+    if pupil_offset_values is None:
+        pupil_offset_values = [20.0]
+    if condenser_focal_values is None:
+        condenser_focal_values = [22.0]
+
+    records = []
+    best_res: Optional[SingleNOptimizationResult] = None
+    best_eta = -1.0
+    best_params: Dict[str, Any] = {}
+
+    total_configs = len(d90_values) * len(condenser_focal_values) * len(pupil_distance_values) * len(pupil_offset_values) * len(n_values)
+    step = 0
+
+    for d90 in d90_values:
+        f_eff = compute_theoretical_focal_length_for_d90(d90)
+        z_fore = 40.0
+        z_slicer = z_fore + f_eff
+
+        for f_cond in condenser_focal_values:
+            for l_pupil in pupil_distance_values:
+                for off_pupil in pupil_offset_values:
+                    for n in n_values:
+                        step += 1
+                        if progress_callback:
+                            progress_callback(
+                                step / total_configs,
+                                f"Hierarchical search: D90={d90:.1f}mm, N={n}, f_cond={f_cond:.1f}mm...",
+                            )
+
+                        sub_cfg = OptimizationConfig(
+                            n_min=n,
+                            n_max=n,
+                            source_mode=cfg.source_mode,
+                            fore_focal_length=f_eff,
+                            z_fore=z_fore,
+                            z_slicer=z_slicer,
+                            pupil_distance_z=l_pupil,
+                            pupil_transverse_offset=off_pupil,
+                            condenser_focal_length=f_cond,
+                            fiber_distance=f_cond,
+                            validation_rays=rays,
+                            exploration_rays=min(300, rays),
+                            random_seed=seed,
+                            max_de_iter=10,
+                            popsize=5,
+                            polish=False,
+                        )
+                        opt = SlicerPupilOptimizer(sub_cfg)
+
+                        if n == 0:
+                            res = opt.evaluate_n0_baseline()
+                        else:
+                            res = opt.optimize_fixed_n(n)
+
+                        eta_tot = float(res.coupling_efficiency)
+                        eta_both = float(res.eta_both_conditional)
+                        tp = float(res.throughput)
+                        n_eff = int(res.n_effective)
+
+                        records.append({
+                            "N": n,
+                            "D90 (mm)": d90,
+                            "Fore f_eff (mm)": round(f_eff, 1),
+                            "Condenser f (mm)": f_cond,
+                            "Pupil L (mm)": l_pupil,
+                            "Pupil Offset (mm)": off_pupil,
+                            "Total Coupling (%)": round(eta_tot * 100.0, 2),
+                            "Joint Cond (%)": round(eta_both * 100.0, 1),
+                            "Throughput (%)": round(tp * 100.0, 1),
+                            "N_effective": n_eff,
+                            "Dominant Limitation": res.dominant_limitation,
+                        })
+
+                        if eta_tot > best_eta:
+                            best_eta = eta_tot
+                            best_res = res
+                            best_params = {
+                                "n": n,
+                                "d90": d90,
+                                "fore_focal_length": f_eff,
+                                "condenser_focal_length": f_cond,
+                                "pupil_distance_z": l_pupil,
+                                "pupil_transverse_offset": off_pupil,
+                                "coupling_efficiency": eta_tot,
+                            }
+
+    df_results = pd.DataFrame(records)
+    summary_text = (
+        f"Hierarchical Search evaluated {len(records)} configurations. "
+        f"Winning architecture: N = {best_params.get('n', 0)} at D90 = {best_params.get('d90', 1.3):.1f} mm, "
+        f"Condenser f = {best_params.get('condenser_focal_length', 22.0):.1f} mm "
+        f"achieving eta_total = {best_eta * 100.0:.2f}%."
+    )
+
+    return HierarchicalSearchResult(
+        best_outer_parameters=best_params,
+        best_inner_result=best_res,
+        all_evaluated_architectures=df_results,
+        summary_text=summary_text,
+    )
+
+
+def export_architecture_design_to_dict(
+    result: SingleNOptimizationResult,
+    config: Optional[OptimizationConfig] = None,
+) -> Dict[str, Any]:
+    """Serializes the complete optomechanical and physical design into a structured dictionary."""
+    cfg = config if config is not None else OptimizationConfig()
+    pa = result.power_accounting
+
+    # Slicer definitions
+    slicer_data = []
+    if result.slicer_table is not None and not result.slicer_table.empty:
+        slicer_data = result.slicer_table.to_dict(orient="records")
+
+    # Pupil definitions
+    pupil_data = []
+    if result.pupil_table is not None and not result.pupil_table.empty:
+        pupil_data = result.pupil_table.to_dict(orient="records")
+
+    # Power accounting stages
+    pa_dict = {}
+    if pa is not None:
+        pa_dict = {
+            "p_launch": float(getattr(pa, "p_launch", 0.0)),
+            "p_after_aperture": float(getattr(pa, "p_after_aperture", 0.0)),
+            "p_on_image_plane": float(getattr(pa, "p_on_image_plane", 0.0)),
+            "p_intercepted_by_slicers": float(getattr(pa, "p_intercepted_by_slicers", 0.0)),
+            "p_lost_at_slicer_gaps": float(getattr(pa, "p_lost_at_slicer_gaps", 0.0)),
+            "p_missed_slicer_array": float(getattr(pa, "p_missed_slicer_array", 0.0)),
+            "p_on_correct_pupil": float(getattr(pa, "p_on_correct_pupil", 0.0)),
+            "p_on_wrong_pupil": float(getattr(pa, "p_on_wrong_pupil", 0.0)),
+            "p_missed_all_pupils": float(getattr(pa, "p_missed_all_pupils", 0.0)),
+            "p_on_condenser": float(getattr(pa, "p_on_condenser", 0.0)),
+            "p_missed_condenser": float(getattr(pa, "p_missed_condenser", 0.0)),
+            "p_at_fiber_plane": float(getattr(pa, "p_at_fiber_plane", 0.0)),
+            "p_inside_core": float(getattr(pa, "p_inside_core", 0.0)),
+            "p_inside_na": float(getattr(pa, "p_inside_na", 0.0)),
+            "p_inside_core_and_na": float(getattr(pa, "p_inside_core_and_na", 0.0)),
+            "eta_total": float(getattr(pa, "eta_total", 0.0)),
+            "eta_core_conditional": float(getattr(pa, "eta_core_conditional", 0.0)),
+            "eta_na_conditional": float(getattr(pa, "eta_na_conditional", 0.0)),
+            "eta_both_conditional": float(getattr(pa, "eta_both_conditional", 0.0)),
+        }
+
+    # Spot & Angular metrics at fiber face
+    spot_info = {}
+    if result.spot_metrics_fiber is not None and result.spot_metrics_fiber.is_valid:
+        sm = result.spot_metrics_fiber
+        spot_info = {
+            "rms_radius_mm": sm.rms_radius,
+            "diameter_50_mm": sm.diameter_50,
+            "diameter_80_mm": sm.diameter_80,
+            "diameter_90_mm": sm.diameter_90,
+            "diameter_95_mm": sm.diameter_95,
+        }
+    else:
+        spot_info = {
+            "rms_radius_mm": "N/A",
+            "diameter_50_mm": "N/A",
+            "diameter_80_mm": "N/A",
+            "diameter_90_mm": "N/A",
+            "diameter_95_mm": "N/A",
+        }
+
+    ang_info = {}
+    if result.angular_metrics_fiber is not None and result.angular_metrics_fiber.is_valid:
+        am = result.angular_metrics_fiber
+        ang_info = {
+            "rms_angle_deg": am.theta_rms_deg,
+            "theta_50_deg": am.theta_50_deg,
+            "theta_80_deg": am.theta_80_deg,
+            "theta_90_deg": am.theta_90_deg,
+            "theta_max_deg": am.theta_max_deg,
+            "na_max": am.na_max_numerical,
+        }
+    else:
+        ang_info = {
+            "rms_angle_deg": "N/A",
+            "theta_50_deg": "N/A",
+            "theta_80_deg": "N/A",
+            "theta_90_deg": "N/A",
+            "theta_max_deg": "N/A",
+            "na_max": "N/A",
+        }
+
+    return {
+        "metadata": {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+            "architecture_name": f"N = {result.n_channels}" if result.n_channels > 0 else "Direct Baseline (N=0)",
+            "n_configured": result.n_channels,
+            "n_effective": result.n_effective,
+            "source_mode": cfg.source_mode,
+            "launched_power_w": result.total_launched_power,
+            "accepted_power_w": result.accepted_power,
+            "eta_total_coupling": result.coupling_efficiency,
+            "eta_estimated_physical": result.eta_estimated_physical,
+            "eta_both_conditional": result.eta_both_conditional,
+            "throughput": result.throughput,
+            "dominant_limitation": result.dominant_limitation,
+            "iterations": result.iterations,
+            "execution_time_sec": result.execution_time_sec,
+        },
+        "optical_train_geometry": {
+            "z_aperture_mm": cfg.z_aperture,
+            "aperture_diameter_mm": cfg.aperture_diameter,
+            "z_fore_mm": cfg.z_fore,
+            "fore_focal_length_mm": cfg.fore_focal_length,
+            "z_intermediate_image_mm": cfg.z_slicer,
+            "pupil_distance_z_mm": cfg.pupil_distance_z,
+            "pupil_transverse_offset_mm": cfg.pupil_transverse_offset,
+            "condenser_focal_length_mm": cfg.condenser_focal_length,
+            "condenser_diameter_mm": cfg.condenser_diameter,
+            "fiber_distance_mm": cfg.fiber_distance,
+            "fiber_core_diameter_mm": cfg.fiber_core_diameter,
+            "fiber_na": cfg.fiber_na,
+        },
+        "slicer_array": slicer_data,
+        "pupil_relay": pupil_data,
+        "detailed_loss_breakdown": result.detailed_loss_breakdown,
+        "power_accounting_stages": pa_dict,
+        "fiber_spot_metrics": spot_info,
+        "fiber_angular_metrics": ang_info,
+        "variable_bounds": {k: list(v) for k, v in result.variable_bounds.items()},
+        "multi_start_statistics": result.multi_start_stats or {},
+    }
+
+
+def export_architecture_design_to_json(
+    result: SingleNOptimizationResult,
+    config: Optional[OptimizationConfig] = None,
+    indent: int = 2,
+) -> str:
+    """Exports complete design as formatted JSON string."""
+    data = export_architecture_design_to_dict(result, config)
+    return json.dumps(data, indent=indent, default=str)
+
+
+def export_architecture_design_to_csv(
+    result: SingleNOptimizationResult,
+    config: Optional[OptimizationConfig] = None,
+) -> str:
+    """Exports key design tables and metrics as a CSV document."""
+    lines = []
+    lines.append("# OPTICAL ARCHITECTURE DESIGN EXPORT")
+    lines.append(f"# Architecture: N={result.n_channels} (N_eff={result.n_effective})")
+    lines.append(f"# eta_total: {result.coupling_efficiency*100.0:.4f}%")
+    lines.append(f"# eta_physical: {result.eta_estimated_physical*100.0:.4f}%")
+    lines.append(f"# Throughput: {result.throughput*100.0:.2f}%")
+    lines.append(f"# Joint Conditional Acceptance: {result.eta_both_conditional*100.0:.2f}%")
+    lines.append("")
+
+    lines.append("[METADATA_AND_SUMMARY]")
+    lines.append("Metric,Value")
+    lines.append(f"N_channels,{result.n_channels}")
+    lines.append(f"N_effective,{result.n_effective}")
+    lines.append(f"eta_total_coupling_pct,{result.coupling_efficiency*100.0:.4f}")
+    lines.append(f"eta_physical_pct,{result.eta_estimated_physical*100.0:.4f}")
+    lines.append(f"eta_both_conditional_pct,{result.eta_both_conditional*100.0:.2f}")
+    lines.append(f"Throughput_pct,{result.throughput*100.0:.2f}")
+    lines.append(f"Accepted_Power_W,{result.accepted_power:.6f}")
+    lines.append(f"Launched_Power_W,{result.total_launched_power:.6f}")
+    lines.append(f"Dominant_Limitation,{result.dominant_limitation}")
+    lines.append("")
+
+    if result.slicer_table is not None and not result.slicer_table.empty:
+        lines.append("[SLICER_MIRRORS_DERIVED_ALIGNMENT]")
+        lines.append(result.slicer_table.to_csv(index=False).strip())
+        lines.append("")
+
+    if result.pupil_table is not None and not result.pupil_table.empty:
+        lines.append("[PUPIL_MIRRORS_DERIVED_ALIGNMENT]")
+        lines.append(result.pupil_table.to_csv(index=False).strip())
+        lines.append("")
+
+    if result.detailed_loss_breakdown:
+        lines.append("[DETAILED_OPTICAL_LOSS_BREAKDOWN]")
+        lines.append("Loss_Mechanism,Fraction_of_Launched_Power_pct")
+        for k, v in result.detailed_loss_breakdown.items():
+            lines.append(f"{k},{v*100.0:.4f}")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def run_alignment_tolerance_study(

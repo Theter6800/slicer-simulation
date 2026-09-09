@@ -80,6 +80,14 @@ from optics.design_optimizer import (
     HighRayUncertaintyReport,
     AlignmentToleranceReport,
     AnalyticalOpticalChecks,
+    OptimizationVariablesSummary,
+    HierarchicalSearchResult,
+    get_optimization_variables_summary,
+    run_hierarchical_architecture_search,
+    export_architecture_design_to_dict,
+    export_architecture_design_to_json,
+    export_architecture_design_to_csv,
+    compute_detailed_loss_breakdown,
 )
 from optics.fore_optics import (
     ForeOpticsMode,
@@ -1148,6 +1156,66 @@ def render_phase_space_and_neff_sweep_figure(sweep_res: MagnificationSweepResult
     return fig
 
 
+def render_20_item_optimization_breakdown(res: SingleNOptimizationResult, config: OptimizationConfig, d90: float):
+    """
+    Renders the complete 20-item final optimization output breakdown (Directive 19):
+    1. Architecture: N_configured, N_effective
+    2. Image: D90
+    3. Slicer: positions, derived angles, power share
+    4. Pupil: positions, derived angles, interception efficiency
+    5. Condenser: focal length, position, clear-aperture use
+    6. Fiber: core conditional acceptance, NA conditional acceptance, joint conditional acceptance
+    7. Losses: slicer gaps, wrong pupil, missed pupil, condenser clipping, fiber spatial rejection, fiber angular rejection
+    8. Final: eta_geometric, eta_physical
+    """
+    pa = res.power_accounting
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        st.markdown("##### 1. Architecture & Image Scale")
+        st.markdown(f"- **N_configured**: `{res.n_channels}` channels ({'Direct baseline' if res.n_channels == 0 else f'{res.n_channels}-channel slicer'})")
+        st.markdown(f"- **N_effective**: `{res.n_effective}` active channels (>= 5% power share)")
+        st.markdown(f"- **Intermediate Image D90**: `{d90:.2f} mm`")
+
+        st.markdown("##### 2. Final Injection Optic (Condenser)")
+        st.markdown(f"- **Focal Length**: `{config.condenser_focal_length:.1f} mm`")
+        z_cond = config.z_slicer + config.pupil_distance_z + config.condenser_distance_z if res.n_channels > 0 else (config.z_slicer + 40.0)
+        st.markdown(f"- **Axial Position (z)**: `{z_cond:.1f} mm`")
+        p_cond_frac = (pa.p_on_condenser / max(1e-9, pa.p_launch) * 100.0) if pa else 0.0
+        st.markdown(f"- **Clear-Aperture Utilization**: `{p_cond_frac:.1f}%`")
+
+    with col_b:
+        st.markdown("##### 3. Fiber Interface Acceptance")
+        eta_core = (pa.eta_core_conditional * 100.0) if pa else (res.core_accepted_fraction * 100.0)
+        eta_na = (pa.eta_na_conditional * 100.0) if pa else (res.na_accepted_fraction * 100.0)
+        eta_both = (pa.eta_both_conditional * 100.0) if pa else (res.both_accepted_fraction * 100.0)
+        st.markdown(f"- **Core Conditional Acceptance**: `{eta_core:.1f}%` (r <= 0.5 mm)")
+        st.markdown(f"- **NA Conditional Acceptance**: `{eta_na:.1f}%` (sin θ <= 0.22)")
+        st.markdown(f"- **Joint Conditional Acceptance**: `{eta_both:.1f}%` (Pass both)")
+
+        st.markdown("##### 4. Overall Coupling Efficiencies")
+        st.markdown(f"- **eta_geometric**: `{res.coupling_efficiency * 100.0:.2f}%` (Accepted / Launched)")
+        st.markdown(f"- **eta_physical (Coated)**: `{res.eta_estimated_physical * 100.0:.2f}%` (R_s * R_p * T_lens)")
+        st.markdown(f"- **Throughput**: `{res.throughput * 100.0:.1f}%` (P_fiber / P_launch)")
+
+    with col_c:
+        st.markdown("##### 5. Detailed Optical Losses")
+        losses = res.detailed_loss_breakdown or compute_detailed_loss_breakdown(pa, res.n_channels)
+        st.markdown(f"- **Slicer Inter-Slice Gaps**: `{losses.get('slicer_inter_slice_gap_loss', 0.0)*100.0:.2f}%`")
+        st.markdown(f"- **Wrong Pupil Strike**: `{losses.get('wrong_pupil_rejection_loss', 0.0)*100.0:.2f}%`")
+        st.markdown(f"- **Missed Pupil Cluster**: `{losses.get('pupil_array_gap_loss', 0.0)*100.0:.2f}%`")
+        st.markdown(f"- **Condenser Clipping**: `{losses.get('condenser_clipping_loss', 0.0)*100.0:.2f}%`")
+        st.markdown(f"- **Fiber Spatial Rejection**: `{losses.get('fiber_spatial_clipping_loss', 0.0)*100.0:.2f}%`")
+        st.markdown(f"- **Fiber Angular Rejection**: `{losses.get('fiber_angular_clipping_loss', 0.0)*100.0:.2f}%`")
+
+    if res.n_channels > 0:
+        st.markdown("##### Slicer & Pupil Component Alignment (Derived)")
+        t_sl, t_pu = st.tabs(["Slicer Mirrors (Derived Alignment)", "Pupil Mirrors (Derived Alignment)"])
+        with t_sl:
+            st.dataframe(res.slicer_table, use_container_width=True)
+        with t_pu:
+            st.dataframe(res.pupil_table, use_container_width=True)
+
+
 def render_tolerance_sensitivity_figure(report: SensitivityReport) -> go.Figure:
     """Renders normalized efficiency eta / eta_0 vs perturbation curves for all components."""
     fig = go.Figure()
@@ -1503,10 +1571,13 @@ def render_supervisor_summary_view(
         st.session_state.optimizer_study = study
     study = ensure_study_compatibility(study)
 
-    # Central Design Question Banner (Requirement 18)
-    st.markdown("### Central Design Question")
+    # Central Design Question Banner (Directive 20)
+    st.markdown("### Central Design Optimization Question")
     st.markdown(
-        "> **Question:** *For the current input beam, does any image slicer configuration achieve higher total fiber coupling than direct focus (N=0)?*"
+        "> **Design Optimization Question:** *For fixed physical slicer dimensions (10.0 mm x 10.0 mm) and a fixed 1.0 mm core, NA = 0.22 fiber, "
+        "what combination of (1) intermediate image magnification / D90, (2) number of genuinely active slicers, (3) slicer positions in the image plane, "
+        "(4) pupil-mirror 3D positions, (5) pupil axial distance / transverse offset, and (6) condenser focal length "
+        "maximizes physically valid optical power coupled into the fiber?*"
     )
 
     win_n = getattr(study, "overall_winner_n", 0)
@@ -1828,6 +1899,59 @@ if st.session_state.app_mode == "Architecture Design Optimizer":
         "pupil mirrors are strictly placed on the chosen side of the optical axis, and all mirror orientations are derived analytically "
         "using 3D vector reflection bisectors at every evaluation."
     )
+
+    # --------------------------------------------------
+    # TOP STATUS PANEL: OPTIMIZATION VARIABLES & BOUNDS (Directive 14)
+    # --------------------------------------------------
+    cur_f_fore_val = float(st.session_state.get("fore_focal_opt", 150.0))
+    cur_f_cond_val = float(st.session_state.get("condenser_focal_length", 22.0))
+    cur_n_val = int(st.session_state.get("optimizer_selected_n", 2))
+    panel_cfg = OptimizationConfig(
+        fore_focal_length=cur_f_fore_val,
+        condenser_focal_length=cur_f_cond_val,
+        source_mode=st.session_state.get("source_mode", "SUN"),
+        random_seed=int(st.session_state.get("opt_seed", 42)),
+    )
+    with st.expander("Optimization Variables & Bounds (Mandatory Classification)", expanded=True):
+        st.caption("All simulator parameters are explicitly classified into 4 distinct physical categories. Slicer aperture is permanently locked at 10.0 mm x 10.0 mm.")
+        var_summary = get_optimization_variables_summary(panel_cfg, n=max(1, cur_n_val))
+
+        c_opt, c_der, c_fix, c_std = st.columns(4)
+        with c_opt:
+            st.markdown("#### 1. Optimized Variables")
+            st.caption("Active optimization parameters")
+            for item in var_summary.optimized_inner:
+                st.markdown(f"**{item['Variable']}**")
+                st.markdown(f"- *Type*: `{item['Type']}`")
+                st.markdown(f"- *Bounds*: `{item['Bounds']}`")
+                st.markdown(f"- *Target*: `{item['Target Plane']}`")
+                st.caption(item['Role'])
+                st.markdown("---")
+        with c_der:
+            st.markdown("#### 2. Derived Variables")
+            st.caption("Derived alignment values (Analytical)")
+            for item in var_summary.derived_alignment:
+                st.markdown(f"**{item['Variable']}**")
+                st.markdown(f"- *Classification*: `{item['Classification']}`")
+                st.caption(f"*Method*: {item['Derivation Method']}")
+                st.markdown(f"- *Status*: `{item['Status']}`")
+                st.markdown("---")
+        with c_fix:
+            st.markdown("#### 3. Fixed Constraints")
+            st.caption("Hardware specifications (Locked)")
+            for item in var_summary.fixed_constraints:
+                st.markdown(f"**{item['Constraint']}**")
+                st.markdown(f"- *Value*: `{item['Value']}`")
+                st.caption(f"*Physics*: {item['Physical Meaning']}")
+                st.markdown("---")
+        with c_std:
+            st.markdown("#### 4. Study Parameters")
+            st.caption("User-selected simulation controls")
+            for item in var_summary.study_parameters:
+                st.markdown(f"**{item['Parameter']}**")
+                st.markdown(f"- *Setting*: `{item['Setting']}`")
+                st.caption(item['Description'])
+                st.markdown("---")
 
     # --------------------------------------------------
     # 0. ANALYTICAL OPTICAL CHECKS & SENSITIVITY PRE-CHECK
@@ -2226,6 +2350,36 @@ if st.session_state.app_mode == "Architecture Design Optimizer":
             st.warning(f"**Does Slicing Beat the Direct Baseline? NO** (Baseline direct coupling N=0 is superior under current image size)")
             st.info(f"**Physical Decision Rationale:** {getattr(study, 'winner_explanation', '')}")
 
+        # --------------------------------------------------
+        # COMPLETE DESIGN EXPORT (JSON / CSV) & 20-ITEM BREAKDOWN (Directives 15, 19)
+        # --------------------------------------------------
+        st.markdown("### 1b. Complete Optomechanical Design Export & 20-Item Breakdown")
+        st.caption("Complete engineering specification of the winning optical architecture including mirror coordinates, derived orientations, detailed losses, and 16-stage accounting:")
+
+        json_design = export_architecture_design_to_json(winner_res, opt_config)
+        csv_design = export_architecture_design_to_csv(winner_res, opt_config)
+
+        d_col1, d_col2 = st.columns(2)
+        with d_col1:
+            st.download_button(
+                label=f"Download Complete Design (JSON) - N={winner_n}",
+                data=json_design,
+                file_name=f"ifu_optical_design_N{winner_n}.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+        with d_col2:
+            st.download_button(
+                label=f"Download Component Specs & Loss Budget (CSV) - N={winner_n}",
+                data=csv_design,
+                file_name=f"ifu_optical_design_N{winner_n}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+        with st.expander("20-Item Final Optimization Output Breakdown", expanded=True):
+            render_20_item_optimization_breakdown(winner_res, opt_config, d90=ps_d90)
+
         st.markdown("### 2. Pre-Slicer Image Diagnostic & Slicer Necessity Check")
         st.caption("Evaluates image footprint formed by fore-optics prior to slicers, comparing D90 against the 10.0 mm slicer aperture width:")
         pre_diag = validate_preslicer_image_diagnostic(fore_focal_length=fore_focal_opt)
@@ -2421,7 +2575,45 @@ if st.session_state.app_mode == "Architecture Design Optimizer":
             fig_sens = render_tolerance_sensitivity_figure(s_rep)
             st.plotly_chart(fig_sens, use_container_width=True)
             st.markdown("##### Recommended Tolerance Budget (for >= 90% Retained Efficiency)")
-            st.dataframe(pd.DataFrame(s_rep.recommended_tolerances), use_container_width=True)
+        st.markdown("### 6d. 2-Level Hierarchical Architecture Search (Outer Grid + Inner DE)")
+        st.caption(
+            "Performs simultaneous 2-level architectural optimization: Level 1 sweeps across outer parameters "
+            "(N in [0..4], image D90, pupil distance, pupil offset, condenser focal length); Level 2 runs inner Differential Evolution "
+            "optimizing slicer and pupil positions for maximum physical fiber coupling eta_total = P_core_AND_NA / P_launch."
+        )
+        if st.button("Execute 2-Level Hierarchical Search", key="btn_run_hierarchical_search", use_container_width=True):
+            with st.spinner("Computing 2-Level Hierarchical Architecture Search..."):
+                h_res = run_hierarchical_architecture_search(
+                    base_config=opt_config,
+                    n_values=[0, 1, 2, 3, 4],
+                    d90_values=[1.3, 10.0, 20.0],
+                    pupil_distance_values=[40.0, 60.0],
+                    pupil_offset_values=[20.0],
+                    condenser_focal_values=[22.0, 30.0],
+                    rays=400,
+                    seed=int(opt_seed),
+                )
+                st.session_state.hierarchical_search_result = h_res
+
+        if st.session_state.get("hierarchical_search_result") is not None:
+            h_res = st.session_state.hierarchical_search_result
+            st.info(f"**Hierarchical Search Result:** {h_res.summary_text}")
+
+            p_best = h_res.best_outer_parameters
+            h1, h2, h3, h4, h5 = st.columns(5)
+            with h1:
+                st.metric("Optimal Slice Count", f"N = {p_best.get('n', 0)}")
+            with h2:
+                st.metric("Optimal Image D90", f"{p_best.get('d90', 1.3):.1f} mm")
+            with h3:
+                st.metric("Condenser Focal Length", f"{p_best.get('condenser_focal_length', 22.0):.1f} mm")
+            with h4:
+                st.metric("Pupil Axial Distance", f"{p_best.get('pupil_distance_z', 40.0):.1f} mm")
+            with h5:
+                st.metric("Max Coupling Efficiency", f"{p_best.get('coupling_efficiency', 0.0)*100.0:.2f}%")
+
+            with st.expander("Evaluated Hierarchical Architecture Grid", expanded=False):
+                st.dataframe(h_res.all_evaluated_architectures, use_container_width=True)
 
         st.markdown("### 7. High-Ray Validation with Uncertainty (100,000 Rays x 10 Seeds)")
         st.caption("Rigorously evaluates statistical confidence interval (mu ± 1.96 sigma / sqrt(N)) comparing candidate architecture vs N=0 baseline:")

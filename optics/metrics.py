@@ -36,6 +36,10 @@ class SpotMetrics:
     def encircled_80_diameter(self) -> float:
         return self.diameter_80
 
+    @property
+    def is_valid(self) -> bool:
+        return self.n_active_rays > 0
+
 
 @dataclass
 class AngularMetrics:
@@ -47,6 +51,18 @@ class AngularMetrics:
     theta_max_deg: float
     mean_theta_deg: float
     na_max_numerical: float
+    n_rays: int = 0
+
+    @property
+    def is_valid(self) -> bool:
+        return self.n_rays > 0
+
+
+def format_metric_or_na(val: Optional[float], is_valid: bool = True, fmt: str = ".2f", unit: str = "") -> str:
+    """Formats numeric metric value, displaying 'N/A' if distribution is empty or invalid."""
+    if not is_valid or val is None or np.isnan(val):
+        return "N/A"
+    return f"{val:{fmt}}{unit}"
 
 
 def compute_spot_metrics(
@@ -214,6 +230,7 @@ def compute_angular_metrics(
         theta_max_deg=max_th,
         mean_theta_deg=mean_th,
         na_max_numerical=float(np.sin(np.radians(max_th))),
+        n_rays=len(incidence_angles_rad),
     )
 
 

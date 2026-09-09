@@ -105,8 +105,10 @@ class PowerAccounting:
         return self.p_at_fiber_plane
 
     def __getattr__(self, name: str) -> Any:
-        if name == "p_at_fiber":
+        if name in ("p_at_fiber", "p_fiber"):
             return getattr(self, "p_at_fiber_plane", 0.0)
+        if name in ("p_lost_slicer_gaps", "p_lost_gaps"):
+            return getattr(self, "p_lost_at_slicer_gaps", 0.0)
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
     # 1. Efficiencies relative to total launched power (Absolute System Metrics)
